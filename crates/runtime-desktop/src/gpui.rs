@@ -98,9 +98,11 @@ impl SharedString {
       let Some(sym) = SYMBOLS.get() else {
          return Self::from_static(intern(s));
       };
-      // SAFETY: Discord's own allocator, with the layout `Arc<str>`'s drop
-      // frees: two counts, then the bytes, padded to 8.
-      let inner = unsafe { alloc_discord(sym, 8, (16 + s.len()).next_multiple_of(8)) };
+      // SAFETY: Discord's own allocator. `Arc<str>`'s layout is exactly
+      // `size_of::<ArcInner<str>>() + len` = 16 + len, align 8. Rounding the
+      // size up changes the layout Discord deallocates with and corrupts its
+      // heap on later frames.
+      let inner = unsafe { alloc_discord(sym, 8, 16 + s.len()) };
       if inner.is_null() {
          return Self::from_static(intern(s));
       }
@@ -1220,12 +1222,6 @@ fn new_button(
    #[cfg(target_arch = "aarch64")]
    // SAFETY: constructs a native Mana `Button` via `x8` sret.
    let mut btn = unsafe { (sym.button_new)(id_static.as_ptr(), id_static.len(), &raw const label_ss) };
-   // Secondary text is invisible on macOS arm64 in this build; Primary
-   // renders the label. Keep click targets working with a real vtable.
-   #[cfg(target_arch = "aarch64")]
-   let _ = variant;
-   #[cfg(target_arch = "aarch64")]
-   let variant = BtnVariant::Primary;
    btn.put(at.variant, variant as u8);
    btn.put(at.scale, size as u8);
    {
