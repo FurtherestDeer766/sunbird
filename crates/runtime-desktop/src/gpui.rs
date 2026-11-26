@@ -318,15 +318,12 @@ type ActionRowFn = unsafe extern "C" fn(
 type ActionRowFn =
    unsafe extern "C" fn(*const SharedString, *const SharedString, *mut RawButton) -> RawDiv;
 
-/// Discord's allocator: `(align, size)` on `x86_64` (`alloc_or_oom`) and
-/// `(size, align)` on macOS arm64 (`__rust_alloc`).
+/// Discord's `alloc_or_oom(align: usize, size: usize) -> *mut u8`.
 type AllocOrOomFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
 
 unsafe fn alloc_discord(sym: &GpuiSymbols, align: usize, size: usize) -> *mut u8 {
-   #[cfg(target_arch = "x86_64")]
-   return unsafe { (sym.alloc_or_oom)(align, size) };
-   #[cfg(target_arch = "aarch64")]
-   return unsafe { (sym.alloc_or_oom)(size, align) };
+   // SAFETY: caller ensures valid non-zero power-of-two `align` and `size`.
+   unsafe { (sym.alloc_or_oom)(align, size) }
 }
 
 struct GpuiSymbols {
