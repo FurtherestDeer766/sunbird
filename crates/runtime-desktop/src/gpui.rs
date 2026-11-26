@@ -1235,12 +1235,21 @@ fn new_button(
    #[cfg(target_arch = "aarch64")]
    // SAFETY: constructs a native Mana `Button` via `x8` sret.
    let mut btn = unsafe { (sym.button_new)(id_static.as_ptr(), id_static.len(), &raw const label_ss) };
-   btn.put(at.variant, variant as u8);
-   btn.put(at.scale, size as u8);
+   // arm64: our synthetic `Rc<dyn Fn>` is cloned/dropped by Discord during
+   // layout and corrupts its heap. Leave the callback unset; the page renders
+   // all sections at once instead of relying on tab clicks.
+   #[cfg(target_arch = "aarch64")]
    {
+      let _ = (variant, rc_ptr, vtbl);
+      btn.put(at.variant, BtnVariant::Primary as u8);
+   }
+   #[cfg(not(target_arch = "aarch64"))]
+   {
+      btn.put(at.variant, variant as u8);
       btn.put(at.on_click, rc_ptr);
       btn.put(at.on_click + 8, vtbl);
    }
+   btn.put(at.scale, size as u8);
    btn
 }
 
@@ -1479,6 +1488,7 @@ impl DesktopCompat {
 }
 
 /// Renders the categorized native Sunbird Settings page into `sret`.
+#[allow(clippy::too_many_lines)]
 pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    let Some(sym) = SYMBOLS.get() else {
       return false;
@@ -1552,7 +1562,34 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
    root = b.push_div(root, tab_bar);
    root = b.push_div(root, b.divider());
 
-   // 2. Active Category Content
+   // 2. Active Category Content. On macOS the click callbacks are disabled,
+   // so show every section at once instead of hiding them behind tabs.
+   #[cfg(target_arch = "aarch64")]
+   {
+      let installed: HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
+      root = render_plugins_tab(
+         &b,
+         root,
+         &plugins,
+         enabled_count,
+         disabled_count,
+         filter,
+         &expanded_plugins,
+         open_select.as_ref(),
+      );
+      root = b.push_div(root, b.text_block("Plugin Catalog", "Official plugins"));
+      root = render_catalog_tab(
+         &b,
+         root,
+         &installed,
+         cat_desktop,
+         cat_partial,
+         cat_mobile,
+      );
+      root = b.push_div(root, b.text_block("General & Updates", "Update controls"));
+      root = render_general_tab(&b, root);
+   }
+   #[cfg(not(target_arch = "aarch64"))]
    match tab {
       Tab::Plugins => {
          root = render_plugins_tab(
