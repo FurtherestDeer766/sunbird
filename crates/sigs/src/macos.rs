@@ -241,8 +241,8 @@ pub fn gpui(image: &Image<'_>) -> Found<Gpui> {
    // Inside `ActionRow`:
    // - `div_style_mut` is called by the first `gap` / style helper right after `div_new`.
    // - `text_block` is called in the first `div_new` block before `div_child_div`.
-   // - `div_child_div` is the last call of `ActionRow` (and also ends the first block).
-   // - `div_child_button` is the call right before the final `div_child_div`.
+   // - `div_child_div` is the last call of `ActionRow` (and also ends the first
+   //   block); it doubles as the button child builder on macOS.
    let div_child_div = ar_calls
       .iter()
       .rev()
@@ -250,23 +250,10 @@ pub fn gpui(image: &Image<'_>) -> Found<Gpui> {
       .find(|&c| near_div(c) && c != div_new && c != div_flex)
       .ok_or("div_child_div not found in ActionRow")?;
 
-   let last_child_idx = ar_calls
-      .iter()
-      .rposition(|&(_, c)| c == div_child_div)
-      .ok_or("final div_child_div missing")?;
-   let div_child_button = ar_calls[..last_child_idx]
-      .iter()
-      .rev()
-      .map(|&(_, c)| c)
-      .find(|&c| {
-         image
-            .function_bounds(c)
-            .is_some_and(|(s, e)| e - s >= 0x40)
-            && c != div_new
-            && c != div_flex
-            && c != div_child_div
-      })
-      .ok_or("div_child_button not found in ActionRow")?;
+   // `Div::child(button)`. The old "call before the last child" heuristic
+   // picked a float style helper, so buttons never got appended to the page.
+   let div_child_button =
+      find_div_child_button(image, 0x328).ok_or("div_child_button not found in ActionRow")?;
 
    let first_child_idx = ar_calls
       .iter()
@@ -412,6 +399,55 @@ fn shared_string_tag_offset(image: &Image<'_>, func: usize) -> Option<usize> {
 
 fn has_shared_string_tag_check(image: &Image<'_>, func: usize) -> bool {
    shared_string_tag_offset(image, func).is_some()
+}
+
+/// Finds `Div::child(button)`: the wrapper that turns a `Button` into an
+/// `AnyElement` and appends it to a `Div`. Its prologue moves the `Div` into
+/// `x19`, the sret into `x20` and the button into `x9`; it calls a helper that
+/// copies `button_size` bytes into the element.
+fn find_div_child_button(image: &Image<'_>, button_size: usize) -> Option<usize> {
+   let mov_size = 0x5280_0000u32 | (u32::try_from(button_size).ok()? << 5) | 2;
+   for i in 0..image.fn_starts.len().saturating_sub(1) {
+      let start = image.fn_starts[i];
+      let end = image.fn_starts[i + 1];
+      if !(0x40..0x200).contains(&(end - start)) {
+         continue;
+      }
+      let code = image.read(start, end - start)?;
+      if code.len() < 0x40 {
+         continue;
+      }
+      let head = &code[..0x40];
+      let has = |insn: u32| {
+         head.as_chunks::<4>()
+            .0
+            .iter()
+            .any(|c| u32::from_le_bytes(*c) == insn)
+      };
+      // `mov x9, x1`, `mov x19, x0`, `mov x20, x8`.
+      if !has(0xAA01_03E9) || !has(0xAA00_03F3) || !has(0xAA08_03F4) {
+         continue;
+      }
+      for (i, chunk) in head.as_chunks::<4>().0.iter().enumerate() {
+         let insn = u32::from_le_bytes(*chunk);
+         if insn & 0xFC00_0000 != 0x9400_0000 {
+            continue;
+         }
+         if let Some((true, target)) = arm64::decode_branch26(insn, start + i * 4)
+            && image
+               .read(target, 0x100)
+               .is_some_and(|body| {
+                  body.as_chunks::<4>()
+                     .0
+                     .iter()
+                     .any(|c| u32::from_le_bytes(*c) == mov_size)
+               })
+         {
+            return Some(start);
+         }
+      }
+   }
+   None
 }
 
 /// Finds the text builder called with `ActionRow`'s two `SharedString`s.
