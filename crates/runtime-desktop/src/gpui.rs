@@ -206,8 +206,12 @@ pub struct RcFnVtbl {
 // SAFETY: vtables contain only function pointers and plain integers.
 unsafe impl Sync for RcFnVtbl {}
 
+/// Discord drops these fake `Rc<dyn Fn>` closures with the vtable's first
+/// entry. A null `drop_in_place` makes that a null call; leak instead.
+const extern "C" fn no_drop(_: *mut c_void) {}
+
 static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
-   drop_in_place: ptr::null(),
+   drop_in_place: no_drop as *const c_void,
    size:          size_of::<u64>(),
    align:         align_of::<u64>(),
    call_once:     switch_callback as *const c_void,
@@ -217,7 +221,7 @@ static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
 };
 
 static BUTTON_FN_VTBL: RcFnVtbl = RcFnVtbl {
-   drop_in_place: ptr::null(),
+   drop_in_place: no_drop as *const c_void,
    size:          size_of::<u64>(),
    align:         align_of::<u64>(),
    call_once:     button_callback as *const c_void,
@@ -1216,10 +1220,18 @@ fn new_button(
    #[cfg(target_arch = "aarch64")]
    // SAFETY: constructs a native Mana `Button` via `x8` sret.
    let mut btn = unsafe { (sym.button_new)(id_static.as_ptr(), id_static.len(), &raw const label_ss) };
+   // Secondary text is invisible on macOS arm64 in this build; Primary
+   // renders the label. Keep click targets working with a real vtable.
+   #[cfg(target_arch = "aarch64")]
+   let _ = variant;
+   #[cfg(target_arch = "aarch64")]
+   let variant = BtnVariant::Primary;
    btn.put(at.variant, variant as u8);
    btn.put(at.scale, size as u8);
-   btn.put(at.on_click, rc_ptr);
-   btn.put(at.on_click + 8, vtbl);
+   {
+      btn.put(at.on_click, rc_ptr);
+      btn.put(at.on_click + 8, vtbl);
+   }
    btn
 }
 
