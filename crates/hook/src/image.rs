@@ -177,9 +177,42 @@ pub struct Image<'a> {
    /// sorted 12-byte `RUNTIME_FUNCTION` `{begin_rva, end_rva, unwind_rva}`
    /// entries.
    pub pdata: Option<(usize, usize, usize)>,
+   /// Sorted Mach-O function start addresses decoded from `LC_FUNCTION_STARTS`.
+   pub fn_starts: Vec<usize>,
    /// Width of a pointer in this image, 4 for 32-bit and 8 for 64-bit. A file
    /// parsed offline keeps the target's width, not the host's.
    pub pointer_width: usize,
+}
+
+/// Decodes Mach-O `LC_FUNCTION_STARTS` ULEB128 deltas relative to `text_base`.
+#[must_use]
+pub fn decode_function_starts(text_base: usize, data: &[u8]) -> Vec<usize> {
+   let mut starts = Vec::new();
+   let mut addr = text_base;
+   let mut at = 0;
+   while at < data.len() {
+      let mut delta = 0usize;
+      let mut shift = 0u32;
+      loop {
+         let Some(&byte) = data.get(at) else {
+            return starts;
+         };
+         at += 1;
+         if shift < usize::BITS {
+            delta |= usize::from(byte & 0x7F) << shift;
+         }
+         if byte & 0x80 == 0 {
+            break;
+         }
+         shift += 7;
+      }
+      if delta == 0 {
+         break;
+      }
+      addr = addr.wrapping_add(delta);
+      starts.push(addr);
+   }
+   starts
 }
 
 #[cfg(target_vendor = "apple")]
@@ -194,10 +227,15 @@ impl Image<'static> {
    /// The segments borrow mapped memory, which dyld keeps mapped while an image
    /// is loaded.
    #[must_use]
+   #[expect(
+      clippy::too_many_lines,
+      reason = "Mach-O load command walk for segments, UUID and function starts"
+   )]
    pub unsafe fn loaded() -> Vec<Self> {
       const MH_MAGIC_64: u32 = 0xFEED_FACF;
       const LC_SEGMENT_64: u32 = 0x19;
       const LC_UUID: u32 = 0x1B;
+      const LC_FUNCTION_STARTS: u32 = 0x26;
       const SEGMENT_COMMAND_SIZE: usize = 72;
       const SECTION_SIZE: usize = 80;
       const INSTRUCTIONS: u32 = 0x8000_0400;
@@ -236,6 +274,9 @@ impl Image<'static> {
             };
             let mut build_id = None;
             let mut segments = Vec::new();
+            let mut text_vmaddr = None;
+            let mut linkedit = None;
+            let mut fn_starts_cmd = None;
             let mut push = |addr: usize, len: usize, executable: bool, writable: bool| {
                let addr = addr.wrapping_add_signed(slide);
                // SAFETY: dyld maps the segment for the image's lifetime.
@@ -253,7 +294,14 @@ impl Image<'static> {
             for _ in 0..u32_at(base + 16) {
                let kind = u32_at(command);
                if kind == LC_SEGMENT_64 {
+                  let seg_name = name_at(command + 8);
                   let (vmaddr, vmsize) = (word_at(command + 24), word_at(command + 32));
+                  let fileoff = word_at(command + 40);
+                  if seg_name == b"__TEXT" {
+                     text_vmaddr = Some(vmaddr);
+                  } else if seg_name == b"__LINKEDIT" {
+                     linkedit = Some((vmaddr, fileoff));
+                  }
                   let initprot = u32_at(command + 60).cast_signed();
                   let readable = vmsize != 0 && initprot & libc::PROT_READ != 0;
                   if readable && initprot & libc::PROT_EXEC != 0 {
@@ -265,16 +313,35 @@ impl Image<'static> {
                      }
                   } else if readable {
                      let writable = initprot & libc::PROT_WRITE != 0
-                        && !READ_ONLY_AFTER_FIXUPS.contains(&name_at(command + 8));
+                        && !READ_ONLY_AFTER_FIXUPS.contains(&seg_name);
                      push(vmaddr, vmsize, false, writable);
                   }
                } else if kind == LC_UUID && build_id.is_none() {
                   // SAFETY: LC_UUID carries a 16-byte UUID at offset 8.
                   let uuid = unsafe { slice::from_raw_parts((command + 8) as *const u8, 16) };
                   build_id = BuildId::from_bytes(uuid);
+               } else if kind == LC_FUNCTION_STARTS {
+                  let dataoff = u32_at(command + 8) as usize;
+                  let datasize = u32_at(command + 12) as usize;
+                  fn_starts_cmd = Some((dataoff, datasize));
                }
                command += u32_at(command + 4) as usize;
             }
+            let fn_starts = if let (
+               Some(text_vm),
+               Some((le_vm, le_off)),
+               Some((dataoff, datasize)),
+            ) = (text_vmaddr, linkedit, fn_starts_cmd)
+               && dataoff >= le_off
+               && datasize > 0
+            {
+               let addr = le_vm.wrapping_add_signed(slide) + (dataoff - le_off);
+               // SAFETY: `LC_FUNCTION_STARTS` lies inside the mapped `__LINKEDIT` segment.
+               let bytes = unsafe { slice::from_raw_parts(addr as *const u8, datasize) };
+               decode_function_starts(text_vm.wrapping_add_signed(slide), bytes)
+            } else {
+               Vec::new()
+            };
             Some(Image {
                path,
                build_id,
@@ -282,6 +349,7 @@ impl Image<'static> {
                eh_frame_hdr: None,
                arm_exidx: None,
                pdata: None,
+               fn_starts,
                pointer_width: size_of::<usize>(),
             })
          })
@@ -340,6 +408,8 @@ unsafe extern "C" {
       new_protection: c_int,
    ) -> c_int;
    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   fn pthread_jit_write_protect_np(enabled: c_int);
 }
 
 /// Protection of the mapping holding `addr`, from the kernel's region table.
@@ -503,6 +573,7 @@ impl Image<'static> {
             eh_frame_hdr: None,
             arm_exidx: None,
             pdata: None,
+            fn_starts: Vec::new(),
             pointer_width: size_of::<usize>(),
          };
          for header in headers {
@@ -783,6 +854,7 @@ impl Image<'static> {
          eh_frame_hdr: None,
          arm_exidx: None,
          pdata,
+         fn_starts: Vec::new(),
          pointer_width,
       })
    }
@@ -954,6 +1026,102 @@ impl Image<'static> {
       unsafe { self.write_code(addr, &absolute_jump(detour)) }?;
       Ok(trampoline)
    }
+
+   /// ARM64 macOS inline hook: redirects `addr` to `detour` using a 16-byte
+   /// `ldr x16, #8; br x16; .quad detour` sequence and returns a `MAP_JIT`
+   /// trampoline that replays `prologue_len` displaced instructions (relocating
+   /// `bl` / `b`) before jumping back to `addr + prologue_len`.
+   ///
+   /// # Safety
+   ///
+   /// `detour` has the function's exact ABI, and no thread runs the function's
+   /// first bytes while they are written.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   pub unsafe fn hook_entry(
+      &self,
+      addr: usize,
+      prologue_len: usize,
+      detour: usize,
+   ) -> Result<usize, crate::Error> {
+      const JUMP_LEN: usize = 16;
+      let refuse = |message: &str| {
+         crate::Error::Attach {
+            backend: "inline-arm64",
+            target:  addr,
+            message: message.to_owned(),
+         }
+      };
+      if prologue_len < JUMP_LEN || !prologue_len.is_multiple_of(4) {
+         return Err(refuse("prologue_len must be at least 16 and 4-byte aligned"));
+      }
+      let displaced = self
+         .read(addr, prologue_len)
+         .ok_or(crate::Error::Unmapped { addr })?;
+
+      let mut code = Vec::with_capacity(prologue_len * 4 + 16);
+      let push_u32 = |buf: &mut Vec<u8>, insn: u32| buf.extend_from_slice(&insn.to_le_bytes());
+      let push_abs_jump = |buf: &mut Vec<u8>, target: usize| {
+         // `ldr x16, #8; br x16; .quad target`
+         push_u32(buf, 0x5800_0050);
+         push_u32(buf, 0xD61F_0200);
+         buf.extend_from_slice(&(target as u64).to_le_bytes());
+      };
+
+      for (idx, chunk) in displaced.as_chunks::<4>().0.iter().enumerate() {
+         let pc = addr + idx * 4;
+         let insn = u32::from_le_bytes(*chunk);
+         if let Some((is_link, target)) = crate::arm64::decode_branch26(insn, pc) {
+            if is_link {
+               // `ldr x16, #12; blr x16; b #12; .quad target`
+               push_u32(&mut code, 0x5800_0070);
+               push_u32(&mut code, 0xD63F_0200);
+               push_u32(&mut code, 0x1400_0003);
+               code.extend_from_slice(&(target as u64).to_le_bytes());
+            } else {
+               push_abs_jump(&mut code, target);
+            }
+         } else if insn & 0x1F00_0000 == 0x1000_0000
+            || insn & 0xFF00_0010 == 0x5400_0000
+            || insn & 0x7E00_0000 == 0x3400_0000
+            || insn & 0x7E00_0000 == 0x3600_0000
+            || insn & 0x3B00_0000 == 0x1800_0000
+         {
+            return Err(refuse("PC-relative instruction in prologue is not supported"));
+         } else {
+            push_u32(&mut code, insn);
+         }
+      }
+      push_abs_jump(&mut code, addr + prologue_len);
+
+      // SAFETY: fresh anonymous MAP_JIT page for the trampoline.
+      let page = unsafe {
+         libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
+            -1,
+            0,
+         )
+      };
+      if page == libc::MAP_FAILED {
+         return Err(refuse("mmap MAP_JIT failed for trampoline"));
+      }
+      let trampoline = page as usize;
+      // SAFETY: toggle JIT write protection for this thread while writing the trampoline.
+      unsafe {
+         pthread_jit_write_protect_np(0);
+         std::ptr::copy_nonoverlapping(code.as_ptr(), page.cast::<u8>(), code.len());
+         pthread_jit_write_protect_np(1);
+         sys_icache_invalidate(page, code.len());
+      }
+
+      let mut jump = Vec::with_capacity(JUMP_LEN);
+      push_abs_jump(&mut jump, detour);
+      // SAFETY: forwarded from the caller.
+      unsafe { self.write_code(addr, &jump) }?;
+      Ok(trampoline)
+   }
 }
 
 impl Image<'_> {
@@ -1113,15 +1281,32 @@ impl Image<'_> {
          return start(last_at_or_below(len / 8, start, addr)?);
       }
 
+      if !self.fn_starts.is_empty() {
+         let idx = self.fn_starts.partition_point(|&start| start <= addr);
+         return idx.checked_sub(1).map(|i| self.fn_starts[i]);
+      }
+
       self.eh_frame_entry(addr).map(|(start, _)| start)
    }
 
    /// Exact `[start, end)` bounds of the function containing `addr`, from PE64
-   /// `.pdata` or the FDE `.eh_frame_hdr` points at.
+   /// `.pdata`, Mach-O `LC_FUNCTION_STARTS`, or the FDE `.eh_frame_hdr` points at.
    #[must_use]
    pub fn function_bounds(&self, addr: usize) -> Option<(usize, usize)> {
       if let Some((image_base, base, len)) = self.pdata {
          return self.pdata_bounds(image_base, base, len / 12, addr);
+      }
+      if !self.fn_starts.is_empty() {
+         let idx = self.fn_starts.partition_point(|&start| start <= addr);
+         let start = self.fn_starts.get(idx.checked_sub(1)?).copied()?;
+         let seg = self.segments.iter().find(|seg| seg.contains(start))?;
+         let seg_end = seg.addr + seg.bytes.len();
+         let end = self
+            .fn_starts
+            .get(idx)
+            .copied()
+            .map_or(seg_end, |next| next.min(seg_end));
+         return (addr < end).then_some((start, end));
       }
       let (start, fde) = self.eh_frame_entry(addr)?;
       let end = start.checked_add(self.fde_range(fde, start)?)?;
@@ -1304,6 +1489,7 @@ mod tests {
          eh_frame_hdr: Some(0x1000),
          arm_exidx: None,
          pdata: None,
+         fn_starts: Vec::new(),
          pointer_width: 8,
       };
       assert_eq!(image.function_bounds(0x2010), Some((0x2000, 0x2080)));

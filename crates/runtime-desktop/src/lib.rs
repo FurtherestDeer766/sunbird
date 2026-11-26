@@ -18,7 +18,6 @@ mod discord;
 #[cfg(target_arch = "x86_64")]
 mod emoji;
 mod fetch;
-#[cfg(target_arch = "x86_64")]
 mod gpui;
 #[cfg(target_arch = "x86_64")]
 mod js;
@@ -27,7 +26,6 @@ mod message;
 #[cfg(target_arch = "x86_64")]
 mod modal;
 mod os;
-#[cfg(target_arch = "x86_64")]
 mod settings;
 #[cfg(target_arch = "x86_64")]
 mod staff;
@@ -98,9 +96,10 @@ pub fn prepare() -> Result<(), Error> {
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
    #[cfg(target_arch = "x86_64")]
+   staff::prepare(&image);
+   settings::install(&image);
+   #[cfg(target_arch = "x86_64")]
    {
-      staff::prepare(&image);
-      settings::install(&image);
       modal::install(&image);
       accessories::install(&image);
       context_menu::install(&image);

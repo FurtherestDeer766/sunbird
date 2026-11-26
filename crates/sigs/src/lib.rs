@@ -15,7 +15,8 @@ pub mod file;
 #[cfg(target_arch = "x86_64")]
 pub mod http;
 pub mod ios;
-pub mod macos;
+pub mod layout;
+#[cfg(target_arch = "aarch64")] pub mod macos;
 pub mod mobile;
 pub mod registry;
 
@@ -51,7 +52,7 @@ pub const LIBRARIES: &[&str] = &["discord-phoenix", "libstand_in.so"];
 #[cfg(target_os = "ios")]
 pub const LIBRARIES: &[&str] = &["PhoenixFatClient"];
 #[cfg(target_os = "macos")]
-pub const LIBRARIES: &[&str] = &["Discord"];
+pub const LIBRARIES: &[&str] = &["Discord", "Discord.bin"];
 #[cfg(target_os = "windows")]
 pub const LIBRARIES: &[&str] = &["Discord.exe", "stand_in.dll"];
 

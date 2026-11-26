@@ -28,7 +28,10 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
-use phoenix_sigs::desktop;
+#[cfg(target_arch = "x86_64")]
+use phoenix_sigs::desktop as sigs;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use phoenix_sigs::macos as sigs;
 
 use crate::gpui::{
    self,
@@ -37,6 +40,7 @@ use crate::gpui::{
 
 const SUNBIRD_PAGE: u8 = 24;
 
+#[cfg(target_arch = "x86_64")]
 type SectionFn = unsafe extern "C" fn(
    sret: *mut RawAnyElement,
    host_state: *mut c_void,
@@ -45,6 +49,15 @@ type SectionFn = unsafe extern "C" fn(
    window: *mut c_void,
    cx: *mut c_void,
 ) -> *mut RawAnyElement;
+
+#[cfg(target_arch = "aarch64")]
+type SectionFn = unsafe extern "C" fn(
+   host_state: *mut c_void,
+   host_data: *mut c_void,
+   host_vtable: *const c_void,
+   window: *mut c_void,
+   cx: *mut c_void,
+) -> RawAnyElement;
 
 static ORIG_SECTION: OnceLock<SectionFn> = OnceLock::new();
 static PAGE_OFFSET: AtomicUsize = AtomicUsize::new(0);
@@ -65,7 +78,7 @@ fn patch_sidebar_label(image: &Image<'static>) {
    const _: () = assert!(NEW_NAME.len() == b"Phoenix".len());
    const _: () = assert!(NEW_ID.len() == b"DESKTOP_PHOENIX".len());
 
-   let label = match desktop::settings_label_parts(image) {
+   let label = match sigs::settings_label_parts(image) {
       Ok(label) => label,
       Err(err) => {
          log::warn!("desktop settings: {err}, leaving sidebar label");
@@ -85,24 +98,28 @@ fn patch_sidebar_label(image: &Image<'static>) {
 }
 
 fn patch_page_visibility(image: &Image<'static>) {
-   let limit = match desktop::settings_visibility(image) {
+   let limit = match sigs::settings_visibility(image) {
       Ok(limit) => limit,
       Err(err) => {
          log::warn!("desktop settings: {err}, leaving it");
          return;
       },
    };
-   // Tightening `cmp r8d, 0xf` -> `0x0e` excludes page 24 (`24 - 9 = 15`) from
+   // Tightening `cmp reg, 0xf` -> `0x0e` excludes page 24 (`24 - 9 = 15`) from
    // the gated switch so `is_page_visible(24)` returns `true` unconditionally.
-   // SAFETY: single-byte immediate patch in `.text` executed from `DllMain`.
-   match unsafe { image.write_code(limit, &[0x0E]) } {
+   #[cfg(target_arch = "x86_64")]
+   let patch: &[u8] = &[0x0E];
+   #[cfg(target_arch = "aarch64")]
+   let patch: &[u8] = &[0x3F, 0x39, 0x00, 0x71]; // `cmp w9, #0xe`
+   // SAFETY: immediate patch in `.text` executed from `prepare` before threads run.
+   match unsafe { image.write_code(limit, patch) } {
       Ok(()) => log::info!("desktop settings: page 24 visibility unlocked"),
       Err(err) => log::warn!("desktop settings: visibility patch failed: {err}"),
    }
 }
 
 fn hook_section_render(image: &Image<'static>) {
-   let (fn_start, offset) = match desktop::settings_section(image) {
+   let (fn_start, offset) = match sigs::settings_section(image) {
       Ok(section) => (section.func, section.page_offset),
       Err(err) => {
          log::warn!("desktop settings: {err}, skipping section hook");
@@ -111,30 +128,39 @@ fn hook_section_render(image: &Image<'static>) {
    };
    PAGE_OFFSET.store(offset, Ordering::Release);
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+   #[cfg(target_arch = "x86_64")]
+   let hook = {
+      let pro = sigs::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+      // SAFETY: runs from `prepare` before Discord threads execute;
+      // `section_detour` matches `host::section`'s exact 6-argument sret ABI.
+      unsafe {
+         image.hook_entry(
+            fn_start,
+            pro.pattern,
+            pro.len,
+            section_detour as *const () as usize,
+         )
+      }
+   };
+   #[cfg(target_arch = "aarch64")]
    // SAFETY: runs from `prepare` before Discord threads execute;
-   // `section_detour` matches `host::section`'s exact 6-argument sret ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
-         fn_start,
-         pro.pattern,
-         pro.len,
-         section_detour as *const () as usize,
-      )
-   } {
+   // `section_detour` matches `host::section`'s AAPCS64 indirect-return (`x8`) ABI.
+   let hook = unsafe { image.hook_entry(fn_start, 16, section_detour as *const () as usize) };
+
+   let trampoline = match hook {
       Ok(trampoline) => trampoline,
       Err(err) => {
          log::warn!("desktop settings: section hook failed: {err}");
          return;
       },
    };
-   // SAFETY: `trampoline` replays `fn_start`'s prologue and jumps to `fn_start
-   // + 19`.
+   // SAFETY: `trampoline` replays `fn_start`'s prologue and jumps to the body.
    let orig = unsafe { std::mem::transmute::<usize, SectionFn>(trampoline) };
    let _ = ORIG_SECTION.set(orig);
    log::info!("desktop settings: hooked section render @ {fn_start:#x} (page offset {offset:#x})");
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn section_detour(
    sret: *mut RawAnyElement,
    host_state: *mut c_void,
@@ -161,4 +187,34 @@ unsafe extern "C" fn section_detour(
    };
    // SAFETY: forwards all arguments verbatim to the original `host::section`.
    unsafe { orig(sret, host_state, host_data, host_vtable, window, cx) }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn section_detour(
+   host_state: *mut c_void,
+   host_data: *mut c_void,
+   host_vtable: *const c_void,
+   window: *mut c_void,
+   cx: *mut c_void,
+) -> RawAnyElement {
+   if !host_state.is_null() {
+      let offset = PAGE_OFFSET.load(Ordering::Acquire);
+      // SAFETY: `host_state` is Discord's live `&mut HostState` for this render
+      // call.
+      let page = unsafe { *host_state.cast::<u8>().add(offset) };
+      if page == SUNBIRD_PAGE {
+         let mut out = RawAnyElement::zeroed();
+         let out_ptr = &raw mut out;
+         let rendered =
+            std::panic::catch_unwind(|| gpui::render_sunbird_page(out_ptr)).unwrap_or(false);
+         if rendered {
+            return out;
+         }
+      }
+   }
+   let Some(orig) = ORIG_SECTION.get().copied() else {
+      return RawAnyElement::zeroed();
+   };
+   // SAFETY: forwards all arguments verbatim to the original `host::section`.
+   unsafe { orig(host_state, host_data, host_vtable, window, cx) }
 }

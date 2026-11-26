@@ -53,6 +53,7 @@ use phoenix_hook::image::{
    BuildId,
    Image,
    Segment,
+   decode_function_starts,
 };
 
 /// `PT_ARM_EXIDX`, the ARM unwind table segment. The `object` crate exposes no
@@ -173,6 +174,7 @@ impl<'a> ElfFile<'a> {
          eh_frame_hdr: None,
          arm_exidx: None,
          pdata: None,
+         fn_starts: Vec::new(),
          pointer_width,
       };
       let mut loads = Vec::new();
@@ -290,6 +292,7 @@ impl<'a> MachOFile<'a> {
          eh_frame_hdr:  None,
          arm_exidx:     None,
          pdata:         None,
+         fn_starts:     Vec::new(),
          pointer_width: 8,
       };
 
@@ -350,6 +353,16 @@ impl<'a> MachOFile<'a> {
                if command.cmd.get(endian) == macho::LC_DYLD_CHAINED_FIXUPS =>
             {
                fixups = Some(command.chained_fixups(endian, data).map_err(parse)?);
+            },
+            LoadCommandVariant::LinkeditData(command)
+               if command.cmd.get(endian) == macho::LC_FUNCTION_STARTS =>
+            {
+               let off = command.dataoff.get(endian) as usize;
+               let size = command.datasize.get(endian) as usize;
+               if let Some(slice) = data.get(off..off + size) {
+                  let base = usize::try_from(text).map_err(address)?;
+                  image.fn_starts = decode_function_starts(base, slice);
+               }
             },
             LoadCommandVariant::Uuid(uuid) if image.build_id.is_none() => {
                image.build_id = BuildId::from_bytes(&uuid.uuid);
@@ -462,6 +475,7 @@ impl<'a> PeFile<'a> {
             eh_frame_hdr: None,
             arm_exidx: None,
             pdata,
+            fn_starts: Vec::new(),
             pointer_width: 8,
          },
          machine,

@@ -319,9 +319,63 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
       },
       Machine::Aarch64 if macho => {
+         #[cfg(target_arch = "aarch64")]
          if image.file_name() == "Discord" {
             report("access gate", macos::access_gate(image).map(at));
-         } else {
+            report(
+               "settings label",
+               macos::settings_label_parts(image)
+                  .map(|label| format!("{} (id {})", at(label.name), at(label.id))),
+            );
+            report("settings visibility", macos::settings_visibility(image).map(at));
+            report(
+               "settings section",
+               macos::settings_section(image).map(|section| {
+                  format!("{} (page +{:#x})", at(section.func), section.page_offset)
+               }),
+            );
+            let gpui = macos::gpui(image);
+            report(
+               "gpui builders",
+               gpui.as_ref()
+                  .map(|gpui| {
+                     format!(
+                        "{} (flex {}, action_row {}, into_any {})",
+                        at(gpui.div_new),
+                        at(gpui.div_flex),
+                        at(gpui.action_row),
+                        at(gpui.div_into_any)
+                     )
+                  })
+                  .map_err(Clone::clone),
+            );
+            let layouts = gpui
+               .as_ref()
+               .map_err(|_| "needs the builders".to_owned())
+               .and_then(|gpui| macos::gpui_layouts(image, gpui));
+            report(
+               "gpui layouts",
+               layouts
+                  .as_ref()
+                  .map(|l| format!("{:x?} {:x?} {:x?}", l.div, l.switch, l.button))
+                  .map_err(Clone::clone),
+            );
+            report(
+               "style offsets",
+               layouts
+                  .as_ref()
+                  .map(|l| format!("{:x?}", l.style))
+                  .map_err(|_| "needs the layouts".to_owned()),
+            );
+            return if missed > 0 {
+               Err(misstep::Report::msg(format!(
+                  "{missed} locators missed this build"
+               )))
+            } else {
+               Ok(())
+            };
+         }
+         {
             report(
                "guest bridge",
                ios::bridge(image).map(|bridge| {

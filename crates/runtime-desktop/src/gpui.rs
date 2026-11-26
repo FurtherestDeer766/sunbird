@@ -7,10 +7,13 @@
 //! inside Discord's GPUI render tree with category tabs, rounded bordered
 //! cards, collapsible plugin settings dropdowns, and native select dropdowns.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+
+#[cfg(target_arch = "x86_64")]
+use std::mem::MaybeUninit;
 use std::{
    collections::HashSet,
    ffi::c_void,
-   mem::MaybeUninit,
    ptr,
    sync::{
       LazyLock,
@@ -30,17 +33,43 @@ use phoenix_runtime::{
       Listed,
    },
 };
+#[cfg(target_arch = "x86_64")]
 use phoenix_sigs::desktop::{
-   self,
+   self as sigs,
+   GpuiLayout,
+   StyleOffsets,
+   layout,
+};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use phoenix_sigs::macos::{
+   self as sigs,
    GpuiLayout,
    StyleOffsets,
    layout,
 };
 
+#[cfg(target_arch = "x86_64")]
 use crate::modal::{
    FieldKind,
    SettingField,
 };
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+enum FieldKind {
+   Text,
+   Number,
+   Secret,
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone)]
+#[allow(dead_code)]
+struct SettingField {
+   plugin:  String,
+   key:     String,
+   title:   String,
+   initial: String,
+   kind:    FieldKind,
+}
 
 /// `gpui::SharedString` (24 bytes): tag `0x18` is `Static(&'static str)` and
 /// `0x19` is `Arc<str>`, the `ArcInner` at `ptr` with the bytes at `+0x10`.
@@ -71,12 +100,16 @@ impl SharedString {
       };
       // SAFETY: Discord's own allocator, with the layout `Arc<str>`'s drop
       // frees: two counts, then the bytes, padded to 8.
-      let inner = unsafe { (sym.alloc_or_oom)(8, (16 + s.len()).next_multiple_of(8)) };
+      let inner = unsafe { alloc_discord(sym, 8, (16 + s.len()).next_multiple_of(8)) };
       if inner.is_null() {
          return Self::from_static(intern(s));
       }
       // SAFETY: `inner` holds `16 + s.len()` bytes, aligned to 8.
       unsafe {
+         #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "allocated with 8-byte alignment"
+         )]
          inner.cast::<[usize; 2]>().write([1, 1]);
          ptr::copy_nonoverlapping(s.as_ptr(), inner.add(16), s.len());
       }
@@ -145,6 +178,13 @@ pub type RawButton = Scratch<{ layout::SCRATCH_CAP }>;
 #[repr(C, align(8))]
 pub struct RawAnyElement([u8; layout::ANY_ELEMENT]);
 
+impl RawAnyElement {
+   #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+   pub const fn zeroed() -> Self {
+      Self([0; layout::ANY_ELEMENT])
+   }
+}
+
 #[repr(C)]
 pub struct RcInner {
    strong:    usize,
@@ -210,29 +250,84 @@ pub fn gpui_px(px: f32) -> u64 {
    u64::from(px.to_bits()) << 32
 }
 
+#[cfg(target_arch = "x86_64")]
 type DivNewFn = unsafe extern "C" fn(*mut RawDiv, *const c_void) -> *mut RawDiv;
+#[cfg(target_arch = "aarch64")]
+type DivNewFn = unsafe extern "C" fn(*const c_void) -> RawDiv;
+
+#[cfg(target_arch = "x86_64")]
 type DivMutFn = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv) -> *mut RawDiv;
+#[cfg(target_arch = "aarch64")]
+type DivMutFn = unsafe extern "C" fn(*mut RawDiv) -> RawDiv;
+
 type DivStyleMutFn = unsafe extern "C" fn(*mut RawDiv) -> *mut u8;
+
+#[cfg(target_arch = "x86_64")]
 type DivChildDivFn = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv, *mut RawDiv) -> *mut RawDiv;
+#[cfg(target_arch = "aarch64")]
+type DivChildDivFn = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv) -> RawDiv;
+
+#[cfg(target_arch = "x86_64")]
 type DivChildBtnFn = unsafe extern "C" fn(*mut RawDiv, *mut RawDiv, *mut RawButton) -> *mut RawDiv;
+#[cfg(target_arch = "aarch64")]
+type DivChildBtnFn = unsafe extern "C" fn(*mut RawDiv, *mut RawButton) -> RawDiv;
+
+#[cfg(target_arch = "x86_64")]
 type DivIntoAnyFn = unsafe extern "C" fn(*mut RawAnyElement, *mut RawDiv) -> *mut RawAnyElement;
+#[cfg(target_arch = "aarch64")]
+type DivIntoAnyFn = unsafe extern "C" fn(*mut RawDiv) -> RawAnyElement;
+
 type DivPushAnyFn = unsafe extern "C" fn(*mut c_void, *mut RawAnyElement);
+
+#[cfg(target_arch = "x86_64")]
 type StrIntoAnyFn =
    unsafe extern "C" fn(*mut RawAnyElement, *mut SharedString) -> *mut RawAnyElement;
+#[cfg(target_arch = "aarch64")]
+type StrIntoAnyFn = unsafe extern "C" fn(*mut SharedString) -> RawAnyElement;
+
+#[cfg(target_arch = "x86_64")]
 type TextBlockFn =
    unsafe extern "C" fn(*mut RawDiv, *const SharedString, *const SharedString) -> *mut RawDiv;
+#[cfg(target_arch = "aarch64")]
+type TextBlockFn = unsafe extern "C" fn(*const SharedString, *const SharedString) -> RawDiv;
+
+#[cfg(target_arch = "x86_64")]
 type SwitchNewFn = unsafe extern "C" fn(*mut RawSwitch, *const u8, usize, u8) -> *mut RawSwitch;
+#[cfg(target_arch = "aarch64")]
+type SwitchNewFn = unsafe extern "C" fn(*const u8, usize, u8) -> RawSwitch;
+
+#[cfg(target_arch = "x86_64")]
 type SwitchIntoDivFn = unsafe extern "C" fn(*mut RawDiv, *mut RawSwitch) -> *mut RawDiv;
+#[cfg(target_arch = "aarch64")]
+type SwitchIntoDivFn = unsafe extern "C" fn(*mut RawSwitch) -> RawDiv;
+
+#[cfg(target_arch = "x86_64")]
 type ButtonNewFn =
    unsafe extern "C" fn(*mut RawButton, *const u8, usize, *const SharedString) -> *mut RawButton;
+#[cfg(target_arch = "aarch64")]
+type ButtonNewFn = unsafe extern "C" fn(*const u8, usize, *const SharedString) -> RawButton;
+
+#[cfg(target_arch = "x86_64")]
 type ActionRowFn = unsafe extern "C" fn(
    *mut RawDiv,
    *const SharedString,
    *const SharedString,
    *mut RawButton,
 ) -> *mut RawDiv;
-/// Discord's `alloc_or_oom(align: usize, size: usize) -> *mut u8`.
+#[cfg(target_arch = "aarch64")]
+type ActionRowFn =
+   unsafe extern "C" fn(*const SharedString, *const SharedString, *mut RawButton) -> RawDiv;
+
+/// Discord's allocator: `(align, size)` on `x86_64` (`alloc_or_oom`) and
+/// `(size, align)` on macOS arm64 (`__rust_alloc`).
 type AllocOrOomFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
+
+unsafe fn alloc_discord(sym: &GpuiSymbols, align: usize, size: usize) -> *mut u8 {
+   #[cfg(target_arch = "x86_64")]
+   return unsafe { (sym.alloc_or_oom)(align, size) };
+   #[cfg(target_arch = "aarch64")]
+   return unsafe { (sym.alloc_or_oom)(size, align) };
+}
 
 struct GpuiSymbols {
    caller_loc:       *const c_void,
@@ -457,17 +552,34 @@ unsafe extern "C" fn button_callback(
          Action::RefreshCatalog => update::fetch_catalog(),
          Action::ReloadPlugin(name) => phoenix_runtime::reload(&name),
          Action::EditPluginCode(name) => {
-            let Some(source) = phoenix_runtime::source(&name) else {
-               phoenix_ui_desktop::toast(&format!("Could not read source for {name}"));
-               return;
-            };
-            crate::modal::open_code_editor(name, source);
+            #[cfg(target_arch = "x86_64")]
+            {
+               let Some(source) = phoenix_runtime::source(&name) else {
+                  phoenix_ui_desktop::toast(&format!("Could not read source for {name}"));
+                  return;
+               };
+               crate::modal::open_code_editor(name, source);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+               let _ = name;
+               phoenix_ui_desktop::open_devtools();
+            }
          },
          Action::OpenInstallUrl => {
+            #[cfg(target_arch = "x86_64")]
             crate::modal::open_install_url();
+            #[cfg(not(target_arch = "x86_64"))]
+            phoenix_ui_desktop::open_devtools();
          },
          Action::EditSetting(field) => {
+            #[cfg(target_arch = "x86_64")]
             crate::modal::open_setting_editor(field);
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+               let _ = field;
+               phoenix_ui_desktop::open_devtools();
+            }
          },
          Action::InstallFromFile => {
             std::thread::spawn(|| {
@@ -478,6 +590,7 @@ unsafe extern "C" fn button_callback(
                   Ok(installed) => {
                      log::info!("sunbird settings: installed {installed} from {file_name}");
                      phoenix_ui_desktop::toast(&format!("Installed {installed}"));
+                     #[cfg(target_arch = "x86_64")]
                      crate::modal::force_redraw();
                   },
                   Err(err) => {
@@ -519,12 +632,12 @@ pub fn locate(image: &Image<'static>) -> bool {
       return true;
    }
 
-   let found = desktop::gpui(image).and_then(|gpui| {
-      let layout = desktop::gpui_layouts(image, &gpui)?;
+   let found = sigs::gpui(image).and_then(|gpui| {
+      let layout = sigs::gpui_layouts(image, &gpui)?;
       Ok((gpui, layout))
    });
    let (
-      desktop::Gpui {
+      sigs::Gpui {
          caller_loc,
          div_new,
          div_flex,
@@ -589,10 +702,18 @@ pub fn locate(image: &Image<'static>) -> bool {
 
 /// `div.f(..)` for a `Div` builder taking and returning it by value.
 fn chain(f: DivMutFn, mut div: RawDiv) -> RawDiv {
-   let mut out = RawDiv::zeroed();
-   // SAFETY: `f` moves `div` into `out`, both buffers fit a `Div`.
-   unsafe { f(&raw mut out, &raw mut div) };
-   out
+   #[cfg(target_arch = "x86_64")]
+   {
+      let mut out = RawDiv::zeroed();
+      // SAFETY: `f` moves `div` into `out`, both buffers fit a `Div`.
+      unsafe { f(&raw mut out, &raw mut div) };
+      out
+   }
+   #[cfg(target_arch = "aarch64")]
+   // SAFETY: `f` moves `div` into the returned `RawDiv` via `x8` sret.
+   unsafe {
+      f(&raw mut div)
+   }
 }
 
 /// The `GpuiLayout` decoded from this `Discord.exe`.
@@ -678,10 +799,10 @@ impl Builder {
    )]
    fn alloc_rc_action(&self, action: Action) -> *mut RcInner {
       let id = register_action(action);
-      // SAFETY: calls Discord's own `alloc_or_oom(align=8, size=24)` so
-      // Discord's `Rc::drop` frees it with the matching allocator.
+      // SAFETY: calls Discord's own allocator so Discord's `Rc::drop` frees
+      // it with the matching allocator.
       unsafe {
-         let raw = (self.sym.alloc_or_oom)(align_of::<RcInner>(), size_of::<RcInner>());
+         let raw = alloc_discord(self.sym, align_of::<RcInner>(), size_of::<RcInner>());
          let inner = raw.cast::<RcInner>();
          inner.write(RcInner {
             strong:    1,
@@ -693,10 +814,18 @@ impl Builder {
    }
 
    fn raw_div(&self) -> RawDiv {
-      let mut d = RawDiv::zeroed();
-      // SAFETY: constructs an empty GPUI `Div` into a buffer that fits it.
-      unsafe { (self.sym.div_new)(&raw mut d, self.sym.caller_loc) };
-      d
+      #[cfg(target_arch = "x86_64")]
+      {
+         let mut d = RawDiv::zeroed();
+         // SAFETY: constructs an empty GPUI `Div` into a buffer that fits it.
+         unsafe { (self.sym.div_new)(&raw mut d, self.sym.caller_loc) };
+         d
+      }
+      #[cfg(target_arch = "aarch64")]
+      // SAFETY: constructs an empty GPUI `Div` into the `x8` sret buffer.
+      unsafe {
+         (self.sym.div_new)(self.sym.caller_loc)
+      }
    }
 
    fn style_div(&self, div: &mut RawDiv, f: impl FnOnce(&Style)) {
@@ -772,10 +901,18 @@ impl Builder {
    }
 
    fn push_div(&self, mut parent: RawDiv, mut child: RawDiv) -> RawDiv {
-      let mut out = RawDiv::zeroed();
-      // SAFETY: moves both `RawDiv`s into `div_child_div`.
-      unsafe { (self.sym.div_child_div)(&raw mut out, &raw mut parent, &raw mut child) };
-      out
+      #[cfg(target_arch = "x86_64")]
+      {
+         let mut out = RawDiv::zeroed();
+         // SAFETY: moves both `RawDiv`s into `div_child_div`.
+         unsafe { (self.sym.div_child_div)(&raw mut out, &raw mut parent, &raw mut child) };
+         out
+      }
+      #[cfg(target_arch = "aarch64")]
+      // SAFETY: moves both `RawDiv`s into `div_child_div` with `x8` sret.
+      unsafe {
+         (self.sym.div_child_div)(&raw mut parent, &raw mut child)
+      }
    }
 
    fn build_button(
@@ -808,19 +945,35 @@ impl Builder {
       action: Action,
    ) -> RawDiv {
       let mut btn = self.build_button(id, label, variant, size, action);
-      let mut out = RawDiv::zeroed();
+      #[cfg(target_arch = "x86_64")]
+      {
+         let mut out = RawDiv::zeroed();
+         // SAFETY: appends native Mana `Button` directly into `parent`.
+         unsafe { (self.sym.div_child_button)(&raw mut out, &raw mut parent, &raw mut btn) };
+         out
+      }
+      #[cfg(target_arch = "aarch64")]
       // SAFETY: appends native Mana `Button` directly into `parent`.
-      unsafe { (self.sym.div_child_button)(&raw mut out, &raw mut parent, &raw mut btn) };
-      out
+      unsafe {
+         (self.sym.div_child_button)(&raw mut parent, &raw mut btn)
+      }
    }
 
    fn text_block(&self, title: &str, subtitle: &str) -> RawDiv {
       let title = SharedString::from_str(title);
       let subtitle = SharedString::from_str(subtitle);
-      let mut out = RawDiv::zeroed();
+      #[cfg(target_arch = "x86_64")]
+      {
+         let mut out = RawDiv::zeroed();
+         // SAFETY: Mana's `TextBlock::new` takes both strings.
+         unsafe { (self.sym.text_block)(&raw mut out, &raw const title, &raw const subtitle) };
+         out
+      }
+      #[cfg(target_arch = "aarch64")]
       // SAFETY: Mana's `TextBlock::new` takes both strings.
-      unsafe { (self.sym.text_block)(&raw mut out, &raw const title, &raw const subtitle) };
-      out
+      unsafe {
+         (self.sym.text_block)(&raw const title, &raw const subtitle)
+      }
    }
 
    fn switch_row(
@@ -833,16 +986,24 @@ impl Builder {
    ) -> RawDiv {
       let at = &self.sym.layout.switch;
       let id_static = intern(id);
-      let mut sw = RawSwitch::zeroed();
-      // SAFETY: creates a native Mana `Switch` in a buffer that fits it.
-      unsafe {
-         (self.sym.switch_new)(
-            &raw mut sw,
-            id_static.as_ptr(),
-            id_static.len(),
-            u8::from(checked),
-         );
-      }
+      #[cfg(target_arch = "x86_64")]
+      let mut sw = {
+         let mut sw = RawSwitch::zeroed();
+         // SAFETY: creates a native Mana `Switch` in a buffer that fits it.
+         unsafe {
+            (self.sym.switch_new)(
+               &raw mut sw,
+               id_static.as_ptr(),
+               id_static.len(),
+               u8::from(checked),
+            );
+         }
+         sw
+      };
+      #[cfg(target_arch = "aarch64")]
+      // SAFETY: creates a native Mana `Switch` via `x8` sret.
+      let mut sw =
+         unsafe { (self.sym.switch_new)(id_static.as_ptr(), id_static.len(), u8::from(checked)) };
       // The defaults these overwrite are static `SharedString`s and `None`,
       // which own nothing.
       sw.put(at.label, SharedString::from_str(label));
@@ -854,10 +1015,18 @@ impl Builder {
       sw.put(at.on_change, self.alloc_rc_action(action));
       sw.put(at.on_change + 8, &raw const SWITCH_FN_VTBL);
 
-      let mut out = RawDiv::zeroed();
+      #[cfg(target_arch = "x86_64")]
+      {
+         let mut out = RawDiv::zeroed();
+         // SAFETY: moves the `Switch` into its `Div`.
+         unsafe { (self.sym.switch_into_div)(&raw mut out, &raw mut sw) };
+         out
+      }
+      #[cfg(target_arch = "aarch64")]
       // SAFETY: moves the `Switch` into its `Div`.
-      unsafe { (self.sym.switch_into_div)(&raw mut out, &raw mut sw) };
-      out
+      unsafe {
+         (self.sym.switch_into_div)(&raw mut sw)
+      }
    }
 
    #[expect(clippy::too_many_arguments, reason = "one per GPUI row part")]
@@ -874,23 +1043,36 @@ impl Builder {
       let title_ss = SharedString::from_str(title);
       let sub_ss = SharedString::from_str(subtitle);
       let mut btn = self.build_button(id, button_label, variant, size, action);
-      let mut out = RawDiv::zeroed();
+      #[cfg(target_arch = "x86_64")]
+      {
+         let mut out = RawDiv::zeroed();
+         // SAFETY: builds Discord's native `ActionRow(title, subtitle, button)`.
+         unsafe {
+            (self.sym.action_row)(
+               &raw mut out,
+               &raw const title_ss,
+               &raw const sub_ss,
+               &raw mut btn,
+            );
+         }
+         out
+      }
+      #[cfg(target_arch = "aarch64")]
       // SAFETY: builds Discord's native `ActionRow(title, subtitle, button)`.
       unsafe {
-         (self.sym.action_row)(
-            &raw mut out,
-            &raw const title_ss,
-            &raw const sub_ss,
-            &raw mut btn,
-         );
+         (self.sym.action_row)(&raw const title_ss, &raw const sub_ss, &raw mut btn)
       }
-      out
    }
 
    fn write_any(&self, mut div: RawDiv, sret: *mut RawAnyElement) {
       // SAFETY: writes the 32-byte `gpui::AnyElement` directly to `sret`.
+      #[cfg(target_arch = "x86_64")]
       unsafe {
          (self.sym.div_into_any)(sret, &raw mut div);
+      }
+      #[cfg(target_arch = "aarch64")]
+      unsafe {
+         sret.write((self.sym.div_into_any)(&raw mut div));
       }
    }
 
@@ -921,11 +1103,14 @@ impl Builder {
       let mut ss = SharedString::from_str(text);
       // SAFETY: moves the `SharedString` into a 32-byte `AnyElement` and
       // pushes it.
+      #[cfg(target_arch = "x86_64")]
       let mut any = unsafe {
          let mut out = MaybeUninit::<RawAnyElement>::uninit();
          str_into_any(out.as_mut_ptr(), &raw mut ss);
          out.assume_init()
       };
+      #[cfg(target_arch = "aarch64")]
+      let mut any = unsafe { str_into_any(&raw mut ss) };
       if !self.push_any(&mut line_div, &mut any) {
          return None;
       }
@@ -978,10 +1163,15 @@ pub fn str_to_any(text: &str) -> Option<RawAnyElement> {
    let str_into_any = SYMBOLS.get()?.str_into_any?;
    let mut ss = SharedString::from_str(text);
    // SAFETY: moves the `SharedString` into a 32-byte `AnyElement`.
+   #[cfg(target_arch = "x86_64")]
    unsafe {
       let mut out = MaybeUninit::<RawAnyElement>::uninit();
       str_into_any(out.as_mut_ptr(), &raw mut ss);
       Some(out.assume_init())
+   }
+   #[cfg(target_arch = "aarch64")]
+   unsafe {
+      Some(str_into_any(&raw mut ss))
    }
 }
 
@@ -1012,16 +1202,23 @@ fn new_button(
    let at = &sym.layout.button;
    let id_static = intern(id);
    let label_ss = SharedString::from_str(label);
-   let mut btn = RawButton::zeroed();
-   // SAFETY: constructs a native Mana `Button` in a buffer that fits it.
-   unsafe {
-      (sym.button_new)(
-         &raw mut btn,
-         id_static.as_ptr(),
-         id_static.len(),
-         &raw const label_ss,
-      );
-   }
+   #[cfg(target_arch = "x86_64")]
+   let mut btn = {
+      let mut btn = RawButton::zeroed();
+      // SAFETY: constructs a native Mana `Button` in a buffer that fits it.
+      unsafe {
+         (sym.button_new)(
+            &raw mut btn,
+            id_static.as_ptr(),
+            id_static.len(),
+            &raw const label_ss,
+         );
+      }
+      btn
+   };
+   #[cfg(target_arch = "aarch64")]
+   // SAFETY: constructs a native Mana `Button` via `x8` sret.
+   let mut btn = unsafe { (sym.button_new)(id_static.as_ptr(), id_static.len(), &raw const label_ss) };
    btn.put(at.variant, variant as u8);
    btn.put(at.scale, size as u8);
    btn.put(at.on_click, rc_ptr);
@@ -1033,10 +1230,18 @@ pub fn push_raw_button(mut parent: RawDiv, mut btn: RawButton) -> RawDiv {
    let Some(sym) = SYMBOLS.get() else {
       return parent;
    };
-   let mut out = RawDiv::zeroed();
+   #[cfg(target_arch = "x86_64")]
+   {
+      let mut out = RawDiv::zeroed();
+      // SAFETY: appends native Mana `Button` directly into `parent`.
+      unsafe { (sym.div_child_button)(&raw mut out, &raw mut parent, &raw mut btn) };
+      out
+   }
+   #[cfg(target_arch = "aarch64")]
    // SAFETY: appends native Mana `Button` directly into `parent`.
-   unsafe { (sym.div_child_button)(&raw mut out, &raw mut parent, &raw mut btn) };
-   out
+   unsafe {
+      (sym.div_child_button)(&raw mut parent, &raw mut btn)
+   }
 }
 
 pub fn write_any(div: RawDiv, sret: *mut RawAnyElement) {
@@ -1092,7 +1297,7 @@ pub fn alloc_rc_u64(value: u64) -> Option<*mut RcInner> {
          clippy::cast_ptr_alignment,
          reason = "allocated with `RcInner`'s alignment"
       )]
-      let ptr = (sym.alloc_or_oom)(align_of::<RcInner>(), size_of::<RcInner>()).cast::<RcInner>();
+      let ptr = alloc_discord(sym, align_of::<RcInner>(), size_of::<RcInner>()).cast::<RcInner>();
       if ptr.is_null() {
          return None;
       }

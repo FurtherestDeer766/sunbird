@@ -48,16 +48,26 @@ fi
 
 mkdir -p "$home"
 
-# Install libphoenix.dylib from a local build if provided, otherwise download.
+# Install libphoenix.dylib from a local build if provided, otherwise build from
+# this checkout or download a prebuilt binary.
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 dylib="$home/libphoenix.dylib"
 if [ -n "${SUNBIRD_DYLIB:-}" ] && [ -f "$SUNBIRD_DYLIB" ]; then
    cp "$SUNBIRD_DYLIB" "$dylib"
    codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
-elif [ -f "$(dirname "$0")/../target/release/libphoenix.dylib" ]; then
-   cp "$(dirname "$0")/../target/release/libphoenix.dylib" "$dylib"
+elif [ -f "$repo_root/target/release/libphoenix.dylib" ]; then
+   cp "$repo_root/target/release/libphoenix.dylib" "$dylib"
    codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
-elif [ -f "$(dirname "$0")/../target/dev-fast/libphoenix.dylib" ]; then
-   cp "$(dirname "$0")/../target/dev-fast/libphoenix.dylib" "$dylib"
+elif [ -f "$repo_root/target/dev-fast/libphoenix.dylib" ]; then
+   cp "$repo_root/target/dev-fast/libphoenix.dylib" "$dylib"
+   codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
+elif [ -f "$repo_root/target/debug/libphoenix.dylib" ]; then
+   cp "$repo_root/target/debug/libphoenix.dylib" "$dylib"
+   codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
+elif [ -f "$repo_root/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+   echo "Building libphoenix.dylib..."
+   (cd "$repo_root" && cargo build --release -p phoenix-loader)
+   cp "$repo_root/target/release/libphoenix.dylib" "$dylib"
    codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
 elif [ ! -f "$dylib" ]; then
    echo "Downloading Sunbird for macOS (arm64)..."
@@ -81,7 +91,7 @@ if [ ! -x "$copy/Contents/MacOS/Discord" ] || [ "$src_mtime" != "$copy_mtime" ];
    rm -rf "$copy"
    cp -R "$discord" "$copy"
    xattr -cr "$copy"
-   codesign --force --sign - "$copy/Contents/MacOS/Discord"
+   codesign --force --sign - --identifier com.discord.DesktopGpui "$copy/Contents/MacOS/Discord"
    echo "$src_mtime" >"$home/discord.mtime"
 fi
 

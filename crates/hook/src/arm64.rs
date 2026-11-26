@@ -48,7 +48,7 @@ pub fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
 }
 
 /// A code site in an ARM64 image that loads or references a target address.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CodeRef {
    pub addr: usize,
    pub target: usize,
@@ -160,4 +160,160 @@ pub fn branch_refs(image: &Image<'_>, range: Range<usize>) -> Vec<CodeRef> {
       }
    }
    refs
+}
+
+/// Every `bl` target in `[start, start + len)`, following a 1-hop outlined
+/// tail-branch `b` thunk when present.
+#[must_use]
+pub fn calls_in(image: &Image<'_>, start: usize, len: usize) -> Vec<(usize, usize)> {
+   let Some(bytes) = image.read(start, len) else {
+      return Vec::new();
+   };
+   let mut out = Vec::new();
+   for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+      let pc = start + i * 4;
+      let insn = u32::from_le_bytes(*chunk);
+      if let Some((true, mut target)) = decode_branch26(insn, pc) {
+         if let Some(thunk) = image.read(target, 16) {
+            for (j, tchunk) in thunk.as_chunks::<4>().0.iter().enumerate() {
+               let tins = u32::from_le_bytes(*tchunk);
+               if tins == 0xD65F_03C0 {
+                  break;
+               }
+               if let Some((false, real)) = decode_branch26(tins, target + j * 4) {
+                  target = real;
+                  break;
+               }
+            }
+         }
+         out.push((pc, target));
+      }
+   }
+   out
+}
+
+/// A `DebugStruct::field` call decoded from an ARM64 derived `Debug::fmt`.
+#[derive(Clone, Copy, Debug)]
+pub struct DebugField {
+   pub name:     usize,
+   pub name_len: usize,
+   pub offset:   usize,
+   pub vtable:   Option<usize>,
+}
+
+/// Decodes `DebugStruct::field(&mut ds, name, &self.field)` calls from an
+/// ARM64 `Debug::fmt(self: &T, f: &mut Formatter)` body.
+#[must_use]
+pub fn debug_fields(code: &[u8], start: usize) -> Vec<DebugField> {
+   let mut adrp_page: [Option<usize>; 32] = [None; 32];
+   let mut reg_addr: [Option<usize>; 32] = [None; 32];
+   let mut reg_imm: [Option<usize>; 32] = [None; 32];
+   let mut reg_self: [Option<usize>; 32] = [None; 32];
+   reg_self[0] = Some(0);
+   let mut saved_self: std::collections::HashMap<usize, [Option<usize>; 32]> =
+      std::collections::HashMap::new();
+   let mut out = Vec::new();
+
+   for (i, chunk) in code.as_chunks::<4>().0.iter().enumerate() {
+      let pc = start + i * 4;
+      if let Some(saved) = saved_self.get(&pc) {
+         reg_self = *saved;
+      }
+      let insn = u32::from_le_bytes(*chunk);
+
+      // Conditional branches (`b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`): remember
+      // self-relative register state at forward targets so fallthrough
+      // pre-indexed loads do not corrupt branch targets.
+      let branch_target =
+         if insn & 0xFF00_0010 == 0x5400_0000 || insn & 0x7E00_0000 == 0x3400_0000 {
+            let imm19 = (((insn >> 5) & 0x7_FFFF).cast_signed() << 13 >> 13) as isize;
+            Some(pc.wrapping_add_signed(imm19 << 2))
+         } else if insn & 0x7E00_0000 == 0x3600_0000 {
+            let imm14 = (((insn >> 5) & 0x3FFF).cast_signed() << 18 >> 18) as isize;
+            Some(pc.wrapping_add_signed(imm14 << 2))
+         } else {
+            None
+         };
+      if let Some(target) = branch_target {
+         if target > pc {
+            saved_self.insert(target, reg_self);
+         }
+         continue;
+      }
+
+      // `mov xD, xS` (`orr xD, xzr, xS` = 0xAA00_03E0) or `mov wD, wS` (0x2A00_03E0)
+      if insn & 0x7FE0_FFE0 == 0x2A00_03E0 {
+         let rd = (insn & 0x1F) as usize;
+         let rm = ((insn >> 16) & 0x1F) as usize;
+         adrp_page[rd] = adrp_page[rm];
+         reg_addr[rd] = reg_addr[rm];
+         reg_imm[rd] = reg_imm[rm];
+         reg_self[rd] = if insn & 0x8000_0000 != 0 {
+            reg_self[rm]
+         } else {
+            None
+         };
+         continue;
+      }
+
+      // Pre-indexed scalar or SIMD load/store `[xN, #simm9]!` (0x3800_0C00 / 0x3B00_0C00)
+      if insn & 0x3B00_0C00 == 0x3800_0C00 {
+         let rn = ((insn >> 5) & 0x1F) as usize;
+         let simm9 = (((insn >> 12) & 0x1FF).cast_signed() << 23 >> 23) as isize;
+         if let Some(off) = reg_self[rn] {
+            reg_self[rn] = Some(off.wrapping_add_signed(simm9));
+         }
+         continue;
+      }
+
+      if let Some((rd, page)) = decode_adrp(insn, pc) {
+         let rd = rd as usize;
+         adrp_page[rd] = Some(page);
+         reg_addr[rd] = None;
+         reg_self[rd] = None;
+         continue;
+      }
+
+      // 64-bit `add xD, xN, #imm12` (unshifted)
+      if insn & 0xFFC0_0000 == 0x9100_0000 {
+         let rd = (insn & 0x1F) as usize;
+         let rn = ((insn >> 5) & 0x1F) as usize;
+         let imm12 = ((insn >> 10) & 0xFFF) as usize;
+         if let Some(page) = adrp_page[rn] {
+            reg_addr[rd] = Some(page.wrapping_add(imm12));
+         }
+         reg_self[rd] = reg_self[rn].map(|off| off.wrapping_add(imm12));
+         continue;
+      }
+
+      // `movz wD, #imm16` (32-bit, shift 0): 0x5280_0000
+      if insn & 0xFFE0_0000 == 0x5280_0000 {
+         let rd = (insn & 0x1F) as usize;
+         let imm16 = ((insn >> 5) & 0xFFFF) as usize;
+         reg_imm[rd] = Some(imm16);
+         reg_self[rd] = None;
+         continue;
+      }
+
+      if let Some((true, _)) = decode_branch26(insn, pc) {
+         if let (Some(name), Some(name_len), Some(offset)) = (reg_addr[1], reg_imm[2], reg_self[3])
+            && name_len > 0
+            && name_len <= 64
+         {
+            out.push(DebugField {
+               name,
+               name_len,
+               offset,
+               vtable: reg_addr[4],
+            });
+         }
+         for r in 0..=18 {
+            adrp_page[r] = None;
+            reg_addr[r] = None;
+            reg_imm[r] = None;
+            reg_self[r] = None;
+         }
+      }
+   }
+   out
 }

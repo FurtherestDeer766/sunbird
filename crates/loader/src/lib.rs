@@ -363,8 +363,9 @@ mod linux {
 mod macos {
    use std::{env, ffi::OsStr};
 
-   /// The macOS client's main executable (`Discord Phoenix.app/Contents/MacOS/Discord`).
-   const CLIENT: &str = "Discord";
+   /// The macOS client's main executable (`Discord Phoenix.app/Contents/MacOS/Discord`,
+   /// or `Discord.bin` when launched via an in-bundle wrapper).
+   const CLIENTS: &[&str] = &["Discord", "Discord.bin"];
 
    /// Whether this process is the main Discord Phoenix client (not CEF helpers
    /// or crash handler). Unlike Linux, `DYLD_INSERT_LIBRARIES` is kept intact
@@ -372,7 +373,11 @@ mod macos {
    /// Hardened Runtime keep system tools and helper bundles from loading it,
    /// and this check ignores any other child process.
    pub fn claim() -> bool {
-      env::current_exe().is_ok_and(|exe| exe.file_name() == Some(OsStr::new(CLIENT)))
+      env::current_exe().is_ok_and(|exe| {
+         exe.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| CLIENTS.contains(&name))
+      })
    }
 }
 
