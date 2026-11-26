@@ -94,7 +94,15 @@ impl SharedString {
 
    /// An `Arc<str>` on Discord's heap, which Discord frees with the element
    /// it moves into. Interned only before the builders resolve.
+   #[cfg_attr(target_arch = "aarch64", allow(unreachable_code))]
    pub fn from_str(s: &str) -> Self {
+      // macOS crashes while cloning/dropping our heap `Arc<str>` strings in
+      // Discord's text style. Static strings are borrowed, never freed, so
+      // they sidestep that path entirely. The set of labels is bounded.
+      #[cfg(target_arch = "aarch64")]
+      {
+         return Self::from_static(intern(s));
+      }
       let Some(sym) = SYMBOLS.get() else {
          return Self::from_static(intern(s));
       };
