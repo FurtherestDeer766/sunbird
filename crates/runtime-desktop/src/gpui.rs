@@ -224,10 +224,19 @@ unsafe impl Sync for RcFnVtbl {}
 /// entry. A null `drop_in_place` makes that a null call; leak instead.
 const extern "C" fn no_drop(_: *mut c_void) {}
 
+/// `Rc::drop` frees `vtable.size + 16` bytes. Discord arm64's closure is 16
+/// bytes (its `RcBox` is 32); reporting 8 frees a 24-byte layout and corrupts
+/// the heap when Discord clones or drops our fake closure.
 static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: no_drop as *const c_void,
+   #[cfg(target_arch = "x86_64")]
    size:          size_of::<u64>(),
+   #[cfg(target_arch = "aarch64")]
+   size:          size_of::<[u64; 2]>(),
+   #[cfg(target_arch = "x86_64")]
    align:         align_of::<u64>(),
+   #[cfg(target_arch = "aarch64")]
+   align:         align_of::<[u64; 2]>(),
    call_once:     switch_callback as *const c_void,
    call_mut:      switch_callback as *const c_void,
    call:          switch_callback as *const c_void,
@@ -236,8 +245,14 @@ static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
 
 static BUTTON_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: no_drop as *const c_void,
+   #[cfg(target_arch = "x86_64")]
    size:          size_of::<u64>(),
+   #[cfg(target_arch = "aarch64")]
+   size:          size_of::<[u64; 2]>(),
+   #[cfg(target_arch = "x86_64")]
    align:         align_of::<u64>(),
+   #[cfg(target_arch = "aarch64")]
+   align:         align_of::<[u64; 2]>(),
    call_once:     button_callback as *const c_void,
    call_mut:      button_callback as *const c_void,
    call:          button_callback as *const c_void,
@@ -1235,20 +1250,15 @@ fn new_button(
    #[cfg(target_arch = "aarch64")]
    // SAFETY: constructs a native Mana `Button` via `x8` sret.
    let mut btn = unsafe { (sym.button_new)(id_static.as_ptr(), id_static.len(), &raw const label_ss) };
-   // arm64: our synthetic `Rc<dyn Fn>` is cloned/dropped by Discord during
-   // layout and corrupts its heap. Leave the callback unset; the page renders
-   // all sections at once instead of relying on tab clicks.
+   // Secondary labels are invisible on macOS arm64 in this build; Primary
+   // renders the label.
    #[cfg(target_arch = "aarch64")]
-   {
-      let _ = (variant, rc_ptr, vtbl);
-      btn.put(at.variant, BtnVariant::Primary as u8);
-   }
-   #[cfg(not(target_arch = "aarch64"))]
-   {
-      btn.put(at.variant, variant as u8);
-      btn.put(at.on_click, rc_ptr);
-      btn.put(at.on_click + 8, vtbl);
-   }
+   let _ = variant;
+   #[cfg(target_arch = "aarch64")]
+   let variant = BtnVariant::Primary;
+   btn.put(at.variant, variant as u8);
+   btn.put(at.on_click, rc_ptr);
+   btn.put(at.on_click + 8, vtbl);
    btn.put(at.scale, size as u8);
    btn
 }
@@ -1317,8 +1327,8 @@ pub fn argb_to_hsla(argb: u32) -> [f32; 4] {
 /// with the matching layout.
 pub fn alloc_rc_u64(value: u64) -> Option<*mut RcInner> {
    let sym = SYMBOLS.get()?;
-   // SAFETY: uses Discord's resolved `alloc_or_oom(align, size)` for a 24-byte
-   // `RcInner` layout matching `std::rc::RcBox<u64>`.
+   // SAFETY: uses Discord's resolved `alloc_or_oom(align, size)` for our
+   // `RcInner` layout, which its `Rc::drop` frees via `vtable.size + 16`.
    unsafe {
       #[expect(
          clippy::cast_ptr_alignment,
