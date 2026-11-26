@@ -195,11 +195,15 @@ impl RawAnyElement {
    }
 }
 
-#[repr(C)]
+/// Discord's `RcBox<u64>` is 32 bytes (8-byte align), not the 24 bytes a
+/// plain `{strong, weak, value}` would suggest. Allocating 24 makes Discord
+/// drop it with a 32-byte layout and corrupt its heap.
+#[repr(C, align(8))]
 pub struct RcInner {
    strong:    usize,
    weak:      usize,
    action_id: u64,
+   _pad:      u64,
 }
 
 #[repr(C)]
@@ -819,6 +823,7 @@ impl Builder {
             strong:    1,
             weak:      1,
             action_id: id,
+            _pad:      0,
          });
          inner
       }
@@ -1299,8 +1304,8 @@ pub fn argb_to_hsla(argb: u32) -> [f32; 4] {
    [h, s, l, a]
 }
 
-/// Allocates an `RcInner { strong: 1, weak: 1, action_id: value }` on
-/// `Discord.exe`'s own heap so Discord's `Rc::drop` frees it cleanly.
+/// Allocates a 32-byte `RcInner` on Discord's own heap so `Rc::drop` frees it
+/// with the matching layout.
 pub fn alloc_rc_u64(value: u64) -> Option<*mut RcInner> {
    let sym = SYMBOLS.get()?;
    // SAFETY: uses Discord's resolved `alloc_or_oom(align, size)` for a 24-byte
@@ -1318,6 +1323,7 @@ pub fn alloc_rc_u64(value: u64) -> Option<*mut RcInner> {
          strong:    1,
          weak:      1,
          action_id: value,
+         _pad:      0,
       });
       Some(ptr)
    }
