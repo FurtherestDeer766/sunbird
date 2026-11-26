@@ -8,22 +8,28 @@
 //!
 //! Each OS implements [`DesktopHost`]; everything above it is shared here.
 
-#[cfg(target_os = "linux")] mod linux;
-#[cfg(windows)] mod webview;
-#[cfg(windows)] mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod webview;
+#[cfg(windows)]
+mod windows;
 
 use std::{
    path::PathBuf,
    process::Command,
-   sync::{
-      Arc,
-      OnceLock,
-   },
+   sync::{Arc, OnceLock},
    thread,
 };
 
-#[cfg(target_os = "linux")] use linux::Host as Os;
-#[cfg(windows)] use windows::Host as Os;
+#[cfg(target_os = "linux")]
+use linux::Host as Os;
+#[cfg(target_os = "macos")]
+use macos::Host as Os;
+#[cfg(windows)]
+use windows::Host as Os;
 
 /// Self-contained HTML/JS/CSS companion dashboard for Desktop settings,
 /// plugin management, catalog installs, OTA updates, and JS console.
@@ -39,9 +45,9 @@ pub enum Error {
 
 /// Configuration and runtime callbacks for the desktop system tray.
 pub struct TrayConfig {
-   pub dashboard_url:    String,
-   pub plugins_dir:      PathBuf,
-   pub on_reload_all:    Option<Arc<dyn Fn() + Send + Sync>>,
+   pub dashboard_url: String,
+   pub plugins_dir: PathBuf,
+   pub on_reload_all: Option<Arc<dyn Fn() + Send + Sync>>,
    pub on_check_updates: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -163,10 +169,10 @@ trait DesktopHost {
    fn start_tray() {}
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 struct Os;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl DesktopHost for Os {}
 
 static CONFIG: OnceLock<TrayConfig> = OnceLock::new();
@@ -224,10 +230,8 @@ fn open_app_window(url: &str, width: u32, height: u32) {
 /// Spawns `command` and waits for it on a background thread, so it never
 /// lingers as a zombie on Unix.
 fn spawn_reaped(command: &mut Command) -> Result<(), Error> {
-   let mut child = command.spawn().map_err(|err| {
-      Error::Platform {
-         message: format!("{}: {err}", command.get_program().display()),
-      }
+   let mut child = command.spawn().map_err(|err| Error::Platform {
+      message: format!("{}: {err}", command.get_program().display()),
    })?;
    let _ = thread::Builder::new()
       .name("sunbird-reap".to_owned())

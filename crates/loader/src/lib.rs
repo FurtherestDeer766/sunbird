@@ -10,19 +10,11 @@
 
 use std::{
    env,
-   panic::{
-      self,
-      AssertUnwindSafe,
-   },
+   panic::{self, AssertUnwindSafe},
    path::PathBuf,
 };
 
-use phoenix_runtime::{
-   Error,
-   Plugin,
-   Started,
-   console::Tee,
-};
+use phoenix_runtime::{Error, Plugin, Started, console::Tee};
 
 #[cfg(unix)]
 #[used]
@@ -64,12 +56,20 @@ extern "C" fn init() {
    if linux::claim() {
       desktop();
    }
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   if macos::claim() {
+      desktop();
+   }
    #[cfg(target_os = "ios")]
    {
       logging();
       ios::start_with_phoenix();
    }
-   #[cfg(not(any(target_os = "ios", all(target_os = "linux", target_arch = "x86_64"))))]
+   #[cfg(not(any(
+      target_os = "ios",
+      all(target_os = "linux", target_arch = "x86_64"),
+      all(target_os = "macos", target_arch = "aarch64")
+   )))]
    {
       logging();
       run();
@@ -79,7 +79,11 @@ extern "C" fn init() {
 /// Hooks Discord before its own code runs, since Desktop Phoenix settles on
 /// the access gate and reads its HTTP vtables in its first frames, then starts
 /// phoenix on a thread.
-#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+   windows,
+   all(target_os = "linux", target_arch = "x86_64"),
+   all(target_os = "macos", target_arch = "aarch64")
+))]
 fn desktop() {
    logging();
    if env::var_os("SUNBIRD_GATE_ONLY").is_some() {
@@ -123,7 +127,11 @@ fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime_mobile::start(home, bundled)
 }
 
-#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+   windows,
+   all(target_os = "linux", target_arch = "x86_64"),
+   all(target_os = "macos", target_arch = "aarch64")
+))]
 fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime_desktop::start(home, bundled)
 }
@@ -132,7 +140,8 @@ fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    target_os = "android",
    target_os = "ios",
    windows,
-   all(target_os = "linux", target_arch = "x86_64")
+   all(target_os = "linux", target_arch = "x86_64"),
+   all(target_os = "macos", target_arch = "aarch64")
 )))]
 fn start(_home: PathBuf, _bundled: Vec<Plugin>) -> Result<Started, Error> {
    Err(Error::NoTarget)
@@ -148,6 +157,23 @@ fn home() -> PathBuf {
       env::var_os("HOME")
          .map_or_else(env::temp_dir, PathBuf::from)
          .join("Library/Application Support/phoenix")
+   }
+   #[cfg(target_os = "macos")]
+   {
+      // Sits directly under macOS Phoenix's `libdiscord` data directory, which
+      // holds `app.lock`, `modules/` and `store/<account>/cache.sqlite`, so its
+      // parent is the `store` root.
+      let data = env::var_os("LIBDISCORD_DATA_DIR").map_or_else(
+         || {
+            env::var_os("HOME")
+               .map_or_else(env::temp_dir, |home| {
+                  PathBuf::from(home).join("Library/Application Support")
+               })
+               .join("libdiscord")
+         },
+         PathBuf::from,
+      );
+      data.join("sunbird")
    }
    #[cfg(target_os = "linux")]
    {
@@ -167,7 +193,10 @@ fn home() -> PathBuf {
       );
       data.join("sunbird")
    }
-   #[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+   #[cfg(all(
+      unix,
+      not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+   ))]
    {
       // /proc/self/cmdline starts with the package name, plus `:process` for
       // secondary processes.
@@ -220,28 +249,16 @@ fn bundled() -> Vec<Plugin> {
 mod unix {
    use std::{
       collections::BTreeMap,
-      ffi::{
-         CStr,
-         c_void,
-      },
-      fs::{
-         self,
-         File,
-      },
-      io::{
-         ErrorKind,
-         Read,
-      },
+      ffi::{CStr, c_void},
+      fs::{self, File},
+      io::{ErrorKind, Read},
       path::Path,
    };
 
    use misstep::ResultExt;
    use phoenix_runtime::Plugin;
    use phoenix_sigs::PLUGIN_BUNDLE;
-   use zip::{
-      ZipArchive,
-      result::ZipError,
-   };
+   use zip::{ZipArchive, result::ZipError};
 
    /// This library's path as the dynamic loader opened it.
    pub fn library_path() -> Option<&'static CStr> {
@@ -300,12 +317,7 @@ mod unix {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux {
-   use std::{
-      env,
-      ffi::OsStr,
-      os::unix::ffi::OsStrExt,
-      path::Path,
-   };
+   use std::{env, ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
 
    /// The Linux client's executable. `AppRun` is a shell script, so the
    /// preload reaches it and every process it starts.
@@ -347,17 +359,28 @@ mod linux {
    }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod macos {
+   use std::{env, ffi::OsStr};
+
+   /// The macOS client's main executable (`Discord Phoenix.app/Contents/MacOS/Discord`).
+   const CLIENT: &str = "Discord";
+
+   /// Whether this process is the main Discord Phoenix client (not CEF helpers
+   /// or crash handler). Unlike Linux, `DYLD_INSERT_LIBRARIES` is kept intact
+   /// because Discord Phoenix re-execs itself during startup on macOS; SIP and
+   /// Hardened Runtime keep system tools and helper bundles from loading it,
+   /// and this check ignores any other child process.
+   pub fn claim() -> bool {
+      env::current_exe().is_ok_and(|exe| exe.file_name() == Some(OsStr::new(CLIENT)))
+   }
+}
+
 #[cfg(target_os = "ios")]
 mod ios {
    use std::{
-      ffi::{
-         CStr,
-         c_void,
-      },
-      sync::atomic::{
-         AtomicBool,
-         Ordering,
-      },
+      ffi::{CStr, c_void},
+      sync::atomic::{AtomicBool, Ordering},
    };
 
    unsafe extern "C" {
@@ -483,12 +506,21 @@ fn logging() {
 /// this library's own path because `/mnt/expand` is not listable), then
 /// secondary-user `/data/user/<uid>/<pkg>/files`, falling back to
 /// `/data/data/<pkg>/files`.
-#[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+#[cfg(all(
+   unix,
+   not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+))]
 fn android_files_dir(package: &str, user: u32, lib_path: Option<&str>) -> PathBuf {
    android_files_dir_with(package, user, lib_path, std::path::Path::is_dir)
 }
 
-#[cfg(any(test, all(unix, not(any(target_os = "ios", target_os = "linux")))))]
+#[cfg(any(
+   test,
+   all(
+      unix,
+      not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+   )
+))]
 fn android_files_dir_with(
    package: &str,
    user: u32,
@@ -516,10 +548,7 @@ fn android_files_dir_with(
 
 #[cfg(test)]
 mod tests {
-   use std::path::{
-      Path,
-      PathBuf,
-   };
+   use std::path::{Path, PathBuf};
 
    use super::android_files_dir_with;
 

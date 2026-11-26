@@ -17,33 +17,22 @@
 //! Addresses are hex at the file's preferred base. One below the base is an
 //! RVA. Every address printed carries its RVA too, for a live process's base.
 
-use std::{
-   collections::HashMap,
-   env,
-   fs,
-};
+use std::{collections::HashMap, env, fs};
 
-use misstep::{
-   OptionExt,
-   ResultExt,
-};
-use phoenix_hook::{
-   image::Image,
-   pattern::Pattern,
-   x86,
-};
+use misstep::{OptionExt, ResultExt};
+#[cfg(target_arch = "aarch64")]
+use phoenix_hook::arm64;
+#[cfg(target_arch = "x86_64")]
+use phoenix_hook::x86;
+use phoenix_hook::{image::Image, pattern::Pattern};
 use phoenix_sigs::{
    Found,
-   desktop,
-   file::{
-      BinaryFile,
-      Machine,
-   },
-   http::DesktopHttpTransport,
-   ios,
-   mobile,
+   file::{BinaryFile, Machine},
+   ios, macos, mobile,
    registry::GatewayRegistry,
 };
+#[cfg(target_arch = "x86_64")]
+use phoenix_sigs::{desktop, http::DesktopHttpTransport};
 
 const USAGE: &str = "usage: sigscan <library.so | Discord.exe | PhoenixFatClient | main.jsbundle> \
                      [check | strings <text> | refs <addr> | dis <addr> [count]]";
@@ -73,13 +62,11 @@ fn main() -> misstep::Result<()> {
    let tools = Tools { image, base };
    match args.get(1).map(String::as_str) {
       None => dump(image),
-      Some("check") => {
-         check(
-            image,
-            parsed.machine(),
-            matches!(parsed, BinaryFile::MachO(_)),
-         )
-      },
+      Some("check") => check(
+         image,
+         parsed.machine(),
+         matches!(parsed, BinaryFile::MachO(_)),
+      ),
       Some("strings") => tools.strings(args.get(2).context(USAGE)?),
       Some("scan") => tools.scan(&args[2..].join(" ")),
       Some("refs") => {
@@ -102,14 +89,12 @@ fn main() -> misstep::Result<()> {
 #[expect(clippy::too_many_lines, reason = "one report per locator")]
 fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()> {
    let mut missed = 0;
-   let mut report = |name: &str, found: Found<String>| {
-      match found {
-         Ok(detail) => println!("ok    {name:<20} {detail}"),
-         Err(why) => {
-            missed += 1;
-            println!("MISS  {name:<20} {why}");
-         },
-      }
+   let mut report = |name: &str, found: Found<String>| match found {
+      Ok(detail) => println!("ok    {name:<20} {detail}"),
+      Err(why) => {
+         missed += 1;
+         println!("MISS  {name:<20} {why}");
+      },
    };
    let at = |addr: usize| format!("{addr:#x}");
    let registry = GatewayRegistry::locate(image).map_err(|err| err.to_string());
@@ -121,6 +106,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          .map_err(Clone::clone),
    );
    match machine {
+      #[cfg(target_arch = "x86_64")]
       Machine::X86_64 => {
          let abi = x86::Abi::of(image);
          let prologues = desktop::Prologues::of(abi);
@@ -145,13 +131,11 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                Some((Some(alloc), Some(dealloc))) => {
                   Ok(format!("alloc {}, dealloc {}", at(alloc), at(dealloc)))
                },
-               Some((alloc, dealloc)) => {
-                  Err(format!(
-                     "alloc {}, dealloc {}",
-                     alloc.map_or_else(|| "missing".to_owned(), at),
-                     dealloc.map_or_else(|| "missing".to_owned(), at)
-                  ))
-               },
+               Some((alloc, dealloc)) => Err(format!(
+                  "alloc {}, dealloc {}",
+                  alloc.map_or_else(|| "missing".to_owned(), at),
+                  dealloc.map_or_else(|| "missing".to_owned(), at)
+               )),
                None => Err("no http transport".to_owned()),
             },
          );
@@ -195,14 +179,12 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "gpui builders",
             gpui.as_ref().map_err(Clone::clone).and_then(|gpui| {
                match (gpui.div_push_any, gpui.str_into_any) {
-                  (Some(push), Some(text)) => {
-                     Ok(format!(
-                        "{} (push_any {}, str_into_any {})",
-                        at(gpui.div_new),
-                        at(push),
-                        at(text)
-                     ))
-                  },
+                  (Some(push), Some(text)) => Ok(format!(
+                     "{} (push_any {}, str_into_any {})",
+                     at(gpui.div_new),
+                     at(push),
+                     at(text)
+                  )),
                   (push, text) => Err(format!("push_any {push:x?}, str_into_any {text:x?}")),
                }
             }),
@@ -337,28 +319,33 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
       },
       Machine::Aarch64 if macho => {
-         report(
-            "guest bridge",
-            ios::bridge(image).map(|bridge| {
-               format!(
-                  "{:#x}, vtable {:#x}, dispatch at +{:#x}, host vtable {:#x}",
-                  bridge.call, bridge.vtable, bridge.dispatch, bridge.host_vtable
-               )
-            }),
-         );
-         let names = ["Networking.request", "@http", "headers"];
-         report("host names", match ios::host_names(image, &names)[..] {
-            [Some(request), Some(http), Some(headers)] => {
-               Ok(format!(
-                  "request {request}, @http {http}, headers {headers}"
-               ))
-            },
-            ref numbers => Err(format!("{names:?} read as {numbers:?}")),
-         });
-         report(
-            "access gate",
-            ios::access_gate(image).map(|[a, b]| format!("{a:#x}, {b:#x}")),
-         );
+         if image.file_name() == "Discord" {
+            report("access gate", macos::access_gate(image).map(at));
+         } else {
+            report(
+               "guest bridge",
+               ios::bridge(image).map(|bridge| {
+                  format!(
+                     "{:#x}, vtable {:#x}, dispatch at +{:#x}, host vtable {:#x}",
+                     bridge.call, bridge.vtable, bridge.dispatch, bridge.host_vtable
+                  )
+               }),
+            );
+            let names = ["Networking.request", "@http", "headers"];
+            report(
+               "host names",
+               match ios::host_names(image, &names)[..] {
+                  [Some(request), Some(http), Some(headers)] => Ok(format!(
+                     "request {request}, @http {http}, headers {headers}"
+                  )),
+                  ref numbers => Err(format!("{names:?} read as {numbers:?}")),
+               },
+            );
+            report(
+               "access gate",
+               ios::access_gate(image).map(|[a, b]| format!("{a:#x}, {b:#x}")),
+            );
+         }
       },
       Machine::Aarch64 => {
          report(
@@ -370,6 +357,13 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
       Machine::Arm => {
          report("staff check", mobile::staff_arm(image).map(at));
          report("emoji check", mobile::emoji_arm(image).map(at));
+      },
+      #[cfg(not(target_arch = "x86_64"))]
+      Machine::X86_64 => {
+         report(
+            "x86_64",
+            Err("sigscan built without x86_64 locators".to_owned()),
+         );
       },
    }
    if missed > 0 {
@@ -411,6 +405,7 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
       println!("   {:<40} {:#010x}{note}", entry.name, entry.handler);
    }
+   #[cfg(target_arch = "x86_64")]
    if let Ok(http) = DesktopHttpTransport::locate(image) {
       let fmt_opt = |addr: Option<usize>| {
          addr.map_or_else(|| "none".to_owned(), |addr| format!("{addr:#010x}"))
@@ -430,7 +425,7 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
 struct Tools<'a> {
    image: &'a Image<'a>,
-   base:  usize,
+   base: usize,
 }
 
 impl Tools<'_> {
@@ -445,16 +440,35 @@ impl Tools<'_> {
       }
       for at in found.into_iter().take(16) {
          println!("{text:?} at {}", self.at(at));
-         let loads = x86::literal_loads(self.image, at);
-         match loads.first().and_then(|load| load.line.target) {
-            None => println!("   no code loads it"),
-            Some(start) if start != at => {
-               println!("   literal starts {} bytes earlier", at - start);
-            },
-            Some(_) => {},
+         #[cfg(target_arch = "aarch64")]
+         {
+            let loads = arm64::adrp_add_refs(self.image, at..at + 1);
+            if loads.is_empty() {
+               println!("   no adrp+add loads");
+            }
+            for load in loads.iter().take(32) {
+               println!(
+                  "   {}  adrp+add -> {}  in fn {} +{:#x}",
+                  self.at(load.addr),
+                  self.at(load.target),
+                  self.at(load.function),
+                  load.addr - load.function
+               );
+            }
          }
-         for load in loads.iter().take(32) {
-            self.print_site(load);
+         #[cfg(target_arch = "x86_64")]
+         {
+            let loads = x86::literal_loads(self.image, at);
+            match loads.first().and_then(|load| load.line.target) {
+               None => println!("   no code loads it"),
+               Some(start) if start != at => {
+                  println!("   literal starts {} bytes earlier", at - start);
+               },
+               Some(_) => {},
+            }
+            for load in loads.iter().take(32) {
+               self.print_site(load);
+            }
          }
       }
       Ok(())
@@ -475,22 +489,54 @@ impl Tools<'_> {
    }
 
    fn refs(&self, target: usize) {
-      let code = x86::code_refs(self.image, target..target + 1);
-      let pointers = self.image.pointers_to(target);
-      println!(
-         "{}: {} code refs, {} pointers",
-         self.at(target),
-         code.len(),
-         pointers.len()
-      );
-      for site in code.iter().take(64) {
-         self.print_site(site);
+      #[cfg(target_arch = "aarch64")]
+      {
+         let adrp = arm64::adrp_add_refs(self.image, target..target + 1);
+         let branches = arm64::branch_refs(self.image, target..target + 1);
+         let pointers = self.image.pointers_to(target);
+         println!(
+            "{}: {} adrp+add refs, {} branch refs, {} pointers",
+            self.at(target),
+            adrp.len(),
+            branches.len(),
+            pointers.len()
+         );
+         for site in adrp.iter().chain(&branches).take(64) {
+            println!(
+               "   {}  in fn {} +{:#x}",
+               self.at(site.addr),
+               self.at(site.function),
+               site.addr - site.function
+            );
+         }
+         for pointer in pointers.into_iter().take(64) {
+            println!("   pointer at {}", self.at(pointer));
+         }
       }
-      for pointer in pointers.into_iter().take(64) {
-         println!("   pointer at {}", self.at(pointer));
+      #[cfg(not(target_arch = "aarch64"))]
+      {
+         #[cfg(target_arch = "x86_64")]
+         let code = x86::code_refs(self.image, target..target + 1);
+         #[cfg(not(target_arch = "x86_64"))]
+         let code: Vec<()> = Vec::new();
+         let pointers = self.image.pointers_to(target);
+         println!(
+            "{}: {} code refs, {} pointers",
+            self.at(target),
+            code.len(),
+            pointers.len()
+         );
+         #[cfg(target_arch = "x86_64")]
+         for site in code.iter().take(64) {
+            self.print_site(site);
+         }
+         for pointer in pointers.into_iter().take(64) {
+            println!("   pointer at {}", self.at(pointer));
+         }
       }
    }
 
+   #[cfg(target_arch = "x86_64")]
    fn print_site(&self, site: &x86::CodeRef) {
       println!(
          "   {}  {}   in fn {} +{:#x}",
@@ -523,6 +569,7 @@ impl Tools<'_> {
          },
          None => usize::MAX,
       };
+      #[cfg(target_arch = "x86_64")]
       for line in x86::disasm(code, addr, count) {
          if line.addr >= end {
             println!("   -- end of function --");
@@ -530,5 +577,7 @@ impl Tools<'_> {
          }
          println!("   {}  {}", self.at(line.addr), line.text);
       }
+      #[cfg(not(target_arch = "x86_64"))]
+      let _ = (code, count, end);
    }
 }

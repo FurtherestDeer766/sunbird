@@ -13,6 +13,10 @@ pub trait DesktopOs {
    /// Makes every visible GPUI window in this process render a frame soon,
    /// from any thread. `validation_offset` is where GPUI's Windows window
    /// state keeps the token a forced update has to carry, 0 when not found.
+   #[cfg_attr(
+      not(target_arch = "x86_64"),
+      expect(dead_code, reason = "GPUI modal hooks are x86_64-only for now")
+   )]
    fn force_redraw(validation_offset: usize);
 
    /// The calling thread's id as the OS and debuggers show it.
@@ -27,24 +31,33 @@ pub trait DesktopOs {
 
    /// Where `image` is mapped, so addresses print as the offsets `sigscan`
    /// shows for the file.
+   #[cfg_attr(
+      not(target_arch = "x86_64"),
+      expect(dead_code, reason = "phoenix.native is x86_64-only for now")
+   )]
    fn image_base(image: &Image<'_>) -> usize;
 
    /// Copies `len` bytes of this process's memory at `addr`, or the readable
    /// start of them. Unmapped memory gives `None` instead of a fault.
+   #[cfg_attr(
+      not(target_arch = "x86_64"),
+      expect(dead_code, reason = "phoenix.native is x86_64-only for now")
+   )]
    fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>>;
 }
 
-#[cfg(target_os = "linux")] pub use linux::Linux as Os;
-#[cfg(windows)] pub use windows::Windows as Os;
+#[cfg(target_os = "linux")]
+pub use linux::Linux as Os;
+#[cfg(target_os = "macos")]
+pub use macos::MacOs as Os;
+#[cfg(windows)]
+pub use windows::Windows as Os;
 
 #[cfg(windows)]
 mod windows {
    use std::ffi::c_void;
 
-   use phoenix_hook::{
-      image::Image,
-      x86,
-   };
+   use phoenix_hook::{image::Image, x86};
 
    use super::DesktopOs;
 
@@ -143,22 +156,13 @@ mod windows {
 mod linux {
    use std::{
       sync::{
-         Mutex,
-         OnceLock,
-         PoisonError,
-         atomic::{
-            AtomicU8,
-            AtomicU64,
-            Ordering,
-         },
+         Mutex, OnceLock, PoisonError,
+         atomic::{AtomicU8, AtomicU64, Ordering},
       },
       time::Instant,
    };
 
-   use phoenix_hook::{
-      image::Image,
-      x86,
-   };
+   use phoenix_hook::{image::Image, x86};
    use phoenix_sigs::desktop;
 
    use super::DesktopOs;
@@ -169,17 +173,17 @@ mod linux {
    type PingFn = unsafe fn(*const usize);
 
    struct Frame {
-      orig:         FrameFn,
+      orig: FrameFn,
       force_render: usize,
-      ping:         PingFn,
+      ping: PingFn,
    }
 
    /// A window's `status`, `ping` and `requested`, each holding one extra
    /// reference so they outlive the window.
    #[derive(Clone, Copy, PartialEq, Eq)]
    struct Window {
-      status:    usize,
-      ping:      usize,
+      status: usize,
+      ping: usize,
       requested: usize,
    }
 
@@ -260,7 +264,7 @@ mod linux {
          return;
       }
       let mut now = libc::timespec {
-         tv_sec:  0,
+         tv_sec: 0,
          tv_nsec: 0,
       };
       // SAFETY: `now` is a valid out pointer; `Instant` reads this clock.
@@ -308,9 +312,9 @@ mod linux {
          // SAFETY: both are functions of these signatures, located by sigs.
          let _ = FRAME.set(unsafe {
             Frame {
-               orig:         std::mem::transmute::<usize, FrameFn>(trampoline),
+               orig: std::mem::transmute::<usize, FrameFn>(trampoline),
                force_render: found.force_render,
-               ping:         std::mem::transmute::<usize, PingFn>(found.ping),
+               ping: std::mem::transmute::<usize, PingFn>(found.ping),
             }
          });
          log::info!("desktop redraw: hooked Wayland frame @ {:#x}", found.frame);
@@ -347,6 +351,41 @@ mod linux {
 
       fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
          x86::read_memory(addr, len)
+      }
+   }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+   use phoenix_hook::{arm64, image::Image};
+
+   use super::DesktopOs;
+
+   pub struct MacOs;
+
+   impl DesktopOs for MacOs {
+      fn install(_image: &Image<'static>) {}
+
+      fn force_redraw(_validation_offset: usize) {}
+
+      fn current_thread_id() -> u32 {
+         let mut tid = 0u64;
+         // SAFETY: null thread queries the calling thread's id into `tid`.
+         unsafe { libc::pthread_threadid_np(0, &raw mut tid) };
+         u32::try_from(tid).unwrap_or(0)
+      }
+
+      fn image_base(image: &Image<'_>) -> usize {
+         image
+            .segments
+            .iter()
+            .map(|segment| segment.addr)
+            .min()
+            .map_or(0, |addr| addr & !0x3FFF)
+      }
+
+      fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
+         arm64::read_memory(addr, len)
       }
    }
 }

@@ -1,91 +1,83 @@
 //! phoenix on Desktop Phoenix: the access gate, the HTTP transport hooks, the
 //! Sunbird pages in User Settings, message accessories and the tray.
 
-#![cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#![cfg(any(
+   windows,
+   all(target_os = "linux", target_arch = "x86_64"),
+   all(target_os = "macos", target_arch = "aarch64")
+))]
 
+#[cfg(target_arch = "x86_64")]
 mod accessories;
+#[cfg(target_arch = "x86_64")]
 mod badges;
+#[cfg(target_arch = "x86_64")]
 mod context_menu;
+#[cfg(target_arch = "x86_64")]
 mod discord;
+#[cfg(target_arch = "x86_64")]
 mod emoji;
 mod fetch;
+#[cfg(target_arch = "x86_64")]
 mod gpui;
+#[cfg(target_arch = "x86_64")]
 mod js;
+#[cfg(target_arch = "x86_64")]
 mod message;
+#[cfg(target_arch = "x86_64")]
 mod modal;
 mod os;
+#[cfg(target_arch = "x86_64")]
 mod settings;
+#[cfg(target_arch = "x86_64")]
 mod staff;
 
+#[cfg(target_arch = "x86_64")]
+use std::time::Duration;
 use std::{
    ffi::c_void,
-   path::{
-      Path,
-      PathBuf,
-   },
-   sync::{
-      Arc,
-      Mutex,
-      PoisonError,
-   },
-   time::Duration,
+   path::{Path, PathBuf},
+   sync::{Arc, Mutex, PoisonError},
 };
 
 use phoenix_hook::image::Image;
 use phoenix_runtime::{
-   Error,
-   Notice,
-   Platform,
-   Plugin,
-   Started,
-   discord::{
-      Authorization,
-      DiscordError,
-   },
-   fetch::{
-      FetchError,
-      Request,
-      Response,
-   },
-   remote::{
-      self,
-      Done,
-   },
-   store::{
-      Rows,
-      StoreError,
-   },
+   Error, Notice, Platform, Plugin, Started,
+   discord::{Authorization, DiscordError},
+   fetch::{FetchError, Request, Response},
+   remote::{self, Done},
+   store::{Rows, StoreError},
 };
 use phoenix_sigs::registry::GatewayRegistry;
-use rquickjs::{
-   Ctx,
-   Object,
-};
+use rquickjs::{Ctx, Object};
 
 struct Desktop;
 
 /// A `POST /ui/choose` or `POST /ui/sheet` body.
+#[cfg(target_arch = "x86_64")]
 #[derive(serde::Deserialize)]
 struct DialogRequest {
-   title:     Option<String>,
-   message:   Option<String>,
-   text:      Option<String>,
+   title: Option<String>,
+   message: Option<String>,
+   text: Option<String>,
    monospace: Option<bool>,
    highlight: Option<bool>,
-   options:   Option<Vec<DialogItem>>,
+   options: Option<Vec<DialogItem>>,
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum DialogItem {
    Label(String),
    Item {
-      label:  String,
+      label: String,
       #[serde(default)]
       danger: bool,
    },
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(serde::Serialize)]
 struct DialogAnswer {
    index: i32,
@@ -94,8 +86,8 @@ struct DialogAnswer {
 /// The target and its swapped gateway registry, once [`prepare`] hooked them.
 static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mutex::new(None);
 
-/// Hooks Discord from `DllMain` on Windows or the `.init_array` constructor on
-/// Linux, before its own code runs.
+/// Hooks Discord from `DllMain` on Windows or the constructor on Unix, before
+/// its own code runs.
 ///
 /// Desktop Phoenix settles on the access gate in its first frames and stops
 /// reading the gateway registry and HTTP vtables once started, so hooks swapped
@@ -105,22 +97,28 @@ pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
-   staff::prepare(&image);
-   settings::install(&image);
-   modal::install(&image);
-   accessories::install(&image);
-   context_menu::install(&image);
-   message::install(&image);
-   badges::install(&image);
-   emoji::install(&image);
+   #[cfg(target_arch = "x86_64")]
+   {
+      staff::prepare(&image);
+      settings::install(&image);
+      modal::install(&image);
+      accessories::install(&image);
+      context_menu::install(&image);
+      message::install(&image);
+      badges::install(&image);
+      emoji::install(&image);
+   }
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
-   if registry.is_ok() {
-      discord::install(&image);
-      accessories::install_optimistic_delete(&image);
+   #[cfg(target_arch = "x86_64")]
+   {
+      if registry.is_ok() {
+         discord::install(&image);
+         accessories::install_optimistic_delete(&image);
+      }
+      // The index is tens of MB and nothing reads it after startup.
+      phoenix_sigs::desktop::release_call_index();
    }
-   // The index is tens of MB and nothing reads it after startup.
-   phoenix_sigs::desktop::release_call_index();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
    Ok(())
 }
@@ -144,22 +142,31 @@ pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    }
    let image = phoenix_runtime::target()?;
    let registry = phoenix_runtime::hook(&image)?;
+   #[cfg(target_arch = "x86_64")]
    discord::install(&image);
    phoenix_runtime::start_hooked(&Desktop, image, registry, home, bundled)
 }
 
 /// Desktop Phoenix shows "This app isn't available for your account" from
 /// `libdiscord_ops_surfaces::client_access::ClientAccessGate`, and blocks the
-/// login on it. One function reads it (1 blocked, 2 no gate, also what a
-/// missing value reads as), and the gate is only considered while it is not 2:
-/// its small caller is `signed_in && access(..) != 2`. This makes it return 2.
-/// Discord settles on the gate within its first frames, so the loader calls
-/// this from `DllMain` or the constructor, before Discord's own code.
+/// login on it. Discord settles on the gate within its first frames, so the
+/// loader calls this from `DllMain` or the constructor, before Discord's own
+/// code.
 fn open_access_gate(image: &Image<'static>) {
-   /// `mov al, 2; ret`
-   const ALLOWED: [u8; 3] = [0xB0, 0x02, 0xC3];
+   #[cfg(target_arch = "x86_64")]
+   let (access, patch): (_, &[u8]) = (
+      phoenix_sigs::desktop::access_gate(image),
+      // `mov al, 2; ret`
+      &[0xB0, 0x02, 0xC3],
+   );
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   let (access, patch): (_, &[u8]) = (
+      phoenix_sigs::macos::access_gate(image),
+      // `mov w0, #0; ret`
+      &[0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6],
+   );
 
-   let access = match phoenix_sigs::desktop::access_gate(image) {
+   let access = match access {
       Ok(access) => access,
       Err(err) => {
          log::warn!("access gate: {err}, leaving it");
@@ -168,7 +175,7 @@ fn open_access_gate(image: &Image<'static>) {
    };
    // SAFETY: Discord's own code, written from `DllMain` or the constructor
    // before it runs.
-   match unsafe { image.write_code(access, &ALLOWED) } {
+   match unsafe { image.write_code(access, patch) } {
       Ok(()) => log::info!("access gate: open"),
       Err(err) => log::error!("access gate: {err}"),
    }
@@ -190,16 +197,31 @@ impl Platform for Desktop {
       headers: Vec<(String, String)>,
       body: Vec<u8>,
    ) -> Result<Response, DiscordError> {
-      discord::send(method, path, headers, body)
+      #[cfg(target_arch = "x86_64")]
+      return discord::send(method, path, headers, body);
+      #[cfg(not(target_arch = "x86_64"))]
+      {
+         let _ = (method, path, headers, body);
+         Err(DiscordError::NoSession)
+      }
    }
 
    fn authorize(&self, request: &Authorization) -> Result<String, DiscordError> {
-      discord::authorize(request)
+      #[cfg(target_arch = "x86_64")]
+      return discord::authorize(request);
+      #[cfg(not(target_arch = "x86_64"))]
+      {
+         let _ = request;
+         Err(DiscordError::NoSession)
+      }
    }
 
    fn init(&self, ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+      #[cfg(target_arch = "x86_64")]
       ctx.store_userdata(js::Desktop::default())
          .map_err(|err| rquickjs::Exception::throw_internal(ctx, &err.to_string()))?;
+      #[cfg(not(target_arch = "x86_64"))]
+      let _ = ctx;
       Ok(())
    }
 
@@ -210,25 +232,48 @@ impl Platform for Desktop {
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()> {
-      js::ui::desktop_patch_api(ctx, plugin, api, messages)
+      #[cfg(target_arch = "x86_64")]
+      return js::ui::desktop_patch_api(ctx, plugin, api, messages);
+      #[cfg(not(target_arch = "x86_64"))]
+      {
+         let _ = (ctx, plugin, api, messages);
+         Ok(())
+      }
    }
 
    fn console<'js>(&self, ctx: &Ctx<'js>, phoenix: &Object<'js>) -> rquickjs::Result<()> {
-      phoenix.set("native", js::native::object(ctx)?)
+      #[cfg(target_arch = "x86_64")]
+      return phoenix.set("native", js::native::object(ctx)?);
+      #[cfg(not(target_arch = "x86_64"))]
+      {
+         let _ = (ctx, phoenix);
+         Ok(())
+      }
    }
 
    fn unload(&self, ctx: &Ctx<'_>, plugin: &str) {
+      #[cfg(target_arch = "x86_64")]
       js::unload(ctx, plugin);
+      #[cfg(not(target_arch = "x86_64"))]
+      let _ = (ctx, plugin);
    }
 
    fn staff(&self, image: &'static Image<'static>) {
+      #[cfg(target_arch = "x86_64")]
       staff::start(image);
+      #[cfg(not(target_arch = "x86_64"))]
+      let _ = image;
    }
 
    fn gateway(&self, store: *mut c_void) {
+      #[cfg(target_arch = "x86_64")]
       // SAFETY: every registry handler takes the store state first, and this
       // runs inside one.
-      unsafe { staff::apply(store) };
+      unsafe {
+         staff::apply(store);
+      }
+      #[cfg(not(target_arch = "x86_64"))]
+      let _ = store;
    }
 
    fn started(&self, _first_run: bool, _plugins: &[String]) {
@@ -242,9 +287,9 @@ impl Platform for Desktop {
       remote::require_token(&state.plugins_dir().with_file_name("debug-shell-token"));
       remote::ensure_started();
       phoenix_ui_desktop::start_tray(phoenix_ui_desktop::TrayConfig {
-         dashboard_url:    remote::dashboard_url(),
-         plugins_dir:      state.plugins_dir(),
-         on_reload_all:    Some(Arc::new(phoenix_runtime::reload_all)),
+         dashboard_url: remote::dashboard_url(),
+         plugins_dir: state.plugins_dir(),
+         on_reload_all: Some(Arc::new(phoenix_runtime::reload_all)),
          on_check_updates: Some(Arc::new(phoenix_runtime::update::check_now)),
       });
       phoenix_ui_desktop::notify(
@@ -255,6 +300,7 @@ impl Platform for Desktop {
    }
 
    fn refresh(&self) {
+      #[cfg(target_arch = "x86_64")]
       modal::force_redraw();
    }
 
@@ -313,8 +359,17 @@ impl Platform for Desktop {
    }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn dialog(_body: &[u8], _sheet: bool) -> remote::Reply {
+   remote::err(
+      "501 Not Implemented",
+      "native dialogs are not implemented on this target",
+   )
+}
+
 /// Opens a native choose or sheet dialog for the dashboard and blocks this
 /// request's thread until it is answered.
+#[cfg(target_arch = "x86_64")]
 fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
    let Ok(request) = serde_json::from_slice::<DialogRequest>(body) else {
       return remote::err("400 Bad Request", "expected a JSON dialog request");
@@ -323,26 +378,20 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
       .options
       .unwrap_or_default()
       .into_iter()
-      .map(|item| {
-         match item {
-            DialogItem::Label(label) => {
-               modal::ChoiceOption {
-                  label,
-                  danger: false,
-               }
-            },
-            DialogItem::Item { label, danger } => modal::ChoiceOption { label, danger },
-         }
+      .map(|item| match item {
+         DialogItem::Label(label) => modal::ChoiceOption {
+            label,
+            danger: false,
+         },
+         DialogItem::Item { label, danger } => modal::ChoiceOption { label, danger },
       })
       .collect::<Vec<_>>();
    let content = if sheet {
-      request.text.map(|text| {
-         modal::ModalSection::Code {
-            title: None,
-            text,
-            monospace: request.monospace.unwrap_or_default(),
-            highlight: request.highlight.unwrap_or_default(),
-         }
+      request.text.map(|text| modal::ModalSection::Code {
+         title: None,
+         text,
+         monospace: request.monospace.unwrap_or_default(),
+         highlight: request.highlight.unwrap_or_default(),
       })
    } else {
       request

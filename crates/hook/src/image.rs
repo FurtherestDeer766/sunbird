@@ -1,33 +1,16 @@
-use std::{
-   borrow::Cow,
-   fmt,
-   path::Path,
-};
+use std::{borrow::Cow, fmt, path::Path};
 #[cfg(unix)]
 use std::{
-   ffi::{
-      CStr,
-      c_int,
-      c_void,
-   },
+   ffi::{CStr, c_int, c_void},
    slice,
-   sync::atomic::{
-      AtomicUsize,
-      Ordering,
-   },
+   sync::atomic::{AtomicUsize, Ordering},
 };
 #[cfg(windows)]
 use std::{
-   ffi::{
-      OsString,
-      c_void,
-   },
+   ffi::{OsString, c_void},
    os::windows::ffi::OsStringExt,
    slice,
-   sync::atomic::{
-      AtomicUsize,
-      Ordering,
-   },
+   sync::atomic::{AtomicUsize, Ordering},
 };
 
 use memchr::memmem;
@@ -104,7 +87,7 @@ unsafe extern "C" {
 /// The `NT_GNU_BUILD_ID` note of an ELF module, 1 to 32 bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BuildId {
-   len:   u8,
+   len: u8,
    bytes: [u8; 32],
 }
 
@@ -165,10 +148,10 @@ impl fmt::Debug for BuildId {
 
 /// One readable `PT_LOAD` segment at its runtime address.
 pub struct Segment<'a> {
-   pub addr:       usize,
-   pub bytes:      Cow<'a, [u8]>,
+   pub addr: usize,
+   pub bytes: Cow<'a, [u8]>,
    pub executable: bool,
-   pub writable:   bool,
+   pub writable: bool,
 }
 
 impl Segment<'_> {
@@ -181,19 +164,19 @@ impl Segment<'_> {
 /// A loaded or offline binary module (ELF or PE), mapped with its relative
 /// relocations applied so pointer slots hold the addresses code would see.
 pub struct Image<'a> {
-   pub path:          String,
-   pub build_id:      Option<BuildId>,
-   pub segments:      Vec<Segment<'a>>,
+   pub path: String,
+   pub build_id: Option<BuildId>,
+   pub segments: Vec<Segment<'a>>,
    /// Address of `.eh_frame_hdr`, from `PT_GNU_EH_FRAME`.
-   pub eh_frame_hdr:  Option<usize>,
+   pub eh_frame_hdr: Option<usize>,
    /// `.ARM.exidx` address and byte length, from `PT_ARM_EXIDX`. ARM32 unwinds
    /// through this table, so it carries the function starts `.eh_frame_hdr`
    /// holds on other targets.
-   pub arm_exidx:     Option<(usize, usize)>,
+   pub arm_exidx: Option<(usize, usize)>,
    /// PE64 exception directory `(image_base, pdata_addr, pdata_len)` holding
    /// sorted 12-byte `RUNTIME_FUNCTION` `{begin_rva, end_rva, unwind_rva}`
    /// entries.
-   pub pdata:         Option<(usize, usize, usize)>,
+   pub pdata: Option<(usize, usize, usize)>,
    /// Width of a pointer in this image, 4 for 32-bit and 8 for 64-bit. A file
    /// parsed offline keeps the target's width, not the host's.
    pub pointer_width: usize,
@@ -349,6 +332,14 @@ unsafe extern "C" {
       count: *mut u32,
       object_name: *mut u32,
    ) -> c_int;
+   fn vm_protect(
+      target_task: u32,
+      address: usize,
+      size: usize,
+      set_maximum: c_int,
+      new_protection: c_int,
+   ) -> c_int;
+   fn sys_icache_invalidate(start: *mut c_void, len: usize);
 }
 
 /// Protection of the mapping holding `addr`, from the kernel's region table.
@@ -391,13 +382,42 @@ unsafe fn swap_protected(
    page_size: usize,
    restore: &[(usize, c_int)],
 ) -> Result<Vec<usize>, crate::Error> {
-   let protect = |page: usize, prot: c_int| {
+   #[cfg(target_vendor = "apple")]
+   let protect = |page: usize, prot: c_int, make_writable: bool| {
+      const VM_PROT_READ: c_int = 0x01;
+      const VM_PROT_WRITE: c_int = 0x02;
+      const VM_PROT_COPY: c_int = 0x10;
+      let target = if make_writable {
+         // Strip PROT_EXEC for W^X and set VM_PROT_COPY so __TEXT pages with
+         // max_prot r-x can be copied-on-write and patched.
+         (prot & !libc::PROT_EXEC) | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
+      } else {
+         prot
+      };
       // SAFETY: `page` is a mapped page the caller looked up.
-      if unsafe { libc::mprotect(page as *mut c_void, page_size, prot) } == 0 {
+      let status = unsafe { vm_protect(mach_task_self_, page, page_size, 0, target) };
+      if status == 0 {
          Ok(())
       } else {
          Err(crate::Error::Protect {
-            addr:   page,
+            addr: page,
+            source: std::io::Error::from_raw_os_error(status),
+         })
+      }
+   };
+   #[cfg(not(target_vendor = "apple"))]
+   let protect = |page: usize, prot: c_int, make_writable: bool| {
+      let target = if make_writable {
+         prot | libc::PROT_WRITE
+      } else {
+         prot
+      };
+      // SAFETY: `page` is a mapped page the caller looked up.
+      if unsafe { libc::mprotect(page as *mut c_void, page_size, target) } == 0 {
+         Ok(())
+      } else {
+         Err(crate::Error::Protect {
+            addr: page,
             source: std::io::Error::last_os_error(),
          })
       }
@@ -407,9 +427,9 @@ unsafe fn swap_protected(
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
    for (done, &(page, prot)) in restore.iter().enumerate() {
-      if let Err(err) = protect(page, prot | libc::PROT_WRITE) {
+      if let Err(err) = protect(page, prot, true) {
          for &(page, prot) in &restore[..done] {
-            let _ = protect(page, prot);
+            let _ = protect(page, prot, false);
          }
          return Err(err);
       }
@@ -422,7 +442,12 @@ unsafe fn swap_protected(
       })
       .collect();
    for &(page, prot) in restore {
-      let _ = protect(page, prot);
+      let _ = protect(page, prot, false);
+      #[cfg(target_vendor = "apple")]
+      if prot & libc::PROT_EXEC != 0 {
+         // SAFETY: `page` is a mapped code page we just wrote.
+         unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
+      }
    }
    Ok(previous)
 }
@@ -555,10 +580,8 @@ pub unsafe fn swap_words(writes: &[(usize, usize)]) -> Result<Vec<usize>, crate:
       .iter()
       .map(|&page| Some((page, protection(&maps, page)?)))
       .collect::<Option<Vec<(usize, c_int)>>>()
-      .ok_or_else(|| {
-         crate::Error::Unmapped {
-            addr: pages.first().copied().unwrap_or(0),
-         }
+      .ok_or_else(|| crate::Error::Unmapped {
+         addr: pages.first().copied().unwrap_or(0),
       })?;
    // SAFETY: forwarded from the caller, and `restore` holds each slot's page.
    unsafe { swap_protected(writes, page_size, &restore) }
@@ -599,8 +622,8 @@ pub(crate) mod win32 {
    #[repr(C)]
    pub struct SystemInfo {
       pub arch_or_oem: u32,
-      pub page_size:   u32,
-      pub _rest:       [u8; 40],
+      pub page_size: u32,
+      pub _rest: [u8; 40],
    }
 
    #[link(name = "kernel32")]
@@ -790,8 +813,8 @@ impl Image<'static> {
 pub unsafe fn swap_words(writes: &[(usize, usize)]) -> Result<Vec<usize>, crate::Error> {
    let mut info = win32::SystemInfo {
       arch_or_oem: 0,
-      page_size:   4096,
-      _rest:       [0; 40],
+      page_size: 4096,
+      _rest: [0; 40],
    };
    // SAFETY: GetSystemInfo fills the struct.
    unsafe { win32::GetSystemInfo(&raw mut info) };
@@ -828,7 +851,7 @@ pub unsafe fn swap_words(writes: &[(usize, usize)]) -> Result<Vec<usize>, crate:
             }
          }
          return Err(crate::Error::Protect {
-            addr:   page,
+            addr: page,
             source: std::io::Error::last_os_error(),
          });
       }
@@ -905,12 +928,10 @@ impl Image<'static> {
       prologue_len: usize,
       detour: usize,
    ) -> Result<usize, crate::Error> {
-      let refuse = |message: &str| {
-         crate::Error::Attach {
-            backend: "inline",
-            target:  addr,
-            message: message.to_owned(),
-         }
+      let refuse = |message: &str| crate::Error::Attach {
+         backend: "inline",
+         target: addr,
+         message: message.to_owned(),
       };
       let displaced = self
          .read(addr, prologue_len)
@@ -1260,26 +1281,29 @@ mod tests {
       put(0x10, &0x40_i32.to_le_bytes());
       // CIE at 0x1020: version 1, "zR", code 1, data -8, return register 16,
       // pointers `pcrel | sdata4`.
-      put(0x20, &[
-         0x10, 0, 0, 0, 0, 0, 0, 0, 1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x1B,
-      ]);
+      put(
+         0x20,
+         &[
+            0x10, 0, 0, 0, 0, 0, 0, 0, 1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x1B,
+         ],
+      );
       // FDE at 0x1040: its CIE 0x24 bytes back, `pc_begin` relative to itself
       // and a `pc_range` of 0x80.
       put(0x40, &[0x14, 0, 0, 0, 0x24, 0, 0, 0]);
       put(0x48, &(0x2000_i32 - 0x1048).to_le_bytes());
       put(0x4C, &0x80_u32.to_le_bytes());
       let image = Image {
-         path:          String::new(),
-         build_id:      None,
-         segments:      vec![Segment {
-            addr:       0x1000,
-            bytes:      Cow::Owned(bytes),
+         path: String::new(),
+         build_id: None,
+         segments: vec![Segment {
+            addr: 0x1000,
+            bytes: Cow::Owned(bytes),
             executable: false,
-            writable:   false,
+            writable: false,
          }],
-         eh_frame_hdr:  Some(0x1000),
-         arm_exidx:     None,
-         pdata:         None,
+         eh_frame_hdr: Some(0x1000),
+         arm_exidx: None,
+         pdata: None,
          pointer_width: 8,
       };
       assert_eq!(image.function_bounds(0x2010), Some((0x2000, 0x2080)));

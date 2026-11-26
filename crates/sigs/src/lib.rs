@@ -8,10 +8,14 @@
 
 use std::ffi::c_void;
 
-#[cfg(target_arch = "x86_64")] pub mod desktop;
-#[cfg(feature = "file")] pub mod file;
-#[cfg(target_arch = "x86_64")] pub mod http;
+#[cfg(target_arch = "x86_64")]
+pub mod desktop;
+#[cfg(feature = "file")]
+pub mod file;
+#[cfg(target_arch = "x86_64")]
+pub mod http;
 pub mod ios;
+pub mod macos;
 pub mod mobile;
 pub mod registry;
 
@@ -30,7 +34,7 @@ fn one<T: Copy>(what: &str, found: &[T]) -> Found<T> {
 /// tag and value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StaffField {
-   pub tag:   usize,
+   pub tag: usize,
    pub value: usize,
 }
 
@@ -38,6 +42,7 @@ pub struct StaffField {
 #[cfg(not(any(
    target_os = "windows",
    target_os = "ios",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 )))]
 pub const LIBRARIES: &[&str] = &["liblibdiscord_wasm_host.so", "libstand_in.so"];
@@ -45,6 +50,8 @@ pub const LIBRARIES: &[&str] = &["liblibdiscord_wasm_host.so", "libstand_in.so"]
 pub const LIBRARIES: &[&str] = &["discord-phoenix", "libstand_in.so"];
 #[cfg(target_os = "ios")]
 pub const LIBRARIES: &[&str] = &["PhoenixFatClient"];
+#[cfg(target_os = "macos")]
+pub const LIBRARIES: &[&str] = &["Discord"];
 #[cfg(target_os = "windows")]
 pub const LIBRARIES: &[&str] = &["Discord.exe", "stand_in.dll"];
 
@@ -89,11 +96,13 @@ pub struct GatewayEvent {
 /// - 16 bytes (2 words) on armeabi-v7a, with `Ok` niche `u64::MAX`
 #[cfg(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 ))]
 pub const RESULT_WORDS: usize = 12;
 #[cfg(not(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64"),
    target_arch = "arm"
 )))]
@@ -103,11 +112,13 @@ pub const RESULT_WORDS: usize = 2;
 
 #[cfg(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 ))]
 const OK_TAG: u64 = u64::MAX - 1;
 #[cfg(not(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 )))]
 const OK_TAG: u64 = u64::MAX;
@@ -145,6 +156,7 @@ mod tests {
       assert!(!err.is_ok());
       #[cfg(any(
          target_os = "windows",
+         target_os = "macos",
          all(target_os = "linux", target_arch = "x86_64")
       ))]
       {
@@ -153,6 +165,7 @@ mod tests {
       }
       #[cfg(not(any(
          target_os = "windows",
+         target_os = "macos",
          all(target_os = "linux", target_arch = "x86_64"),
          target_arch = "arm"
       )))]

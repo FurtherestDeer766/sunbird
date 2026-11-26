@@ -5,22 +5,22 @@
 //! - [`Image`](image::Image) views a loaded ELF module, scans it for
 //!   [`Pattern`](pattern::Pattern)s, and swaps pointers in its read-only data.
 
-use std::{
-   ffi::c_void,
-   ptr::NonNull,
-};
+use std::{ffi::c_void, ptr::NonNull};
 
+#[cfg(target_arch = "aarch64")]
+pub mod arm64;
 // On wasm32 only the parts the host-side patcher reads build; live process
 // scanning uses dl_iterate_phdr on Unix and PE module enumeration on Windows.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 pub mod image;
 pub mod pattern;
-#[cfg(target_arch = "x86_64")] pub mod x86;
 #[cfg(all(
    target_os = "android",
    any(target_arch = "aarch64", target_arch = "arm")
 ))]
 pub mod shadowhook;
+#[cfg(target_arch = "x86_64")]
+pub mod x86;
 
 #[cfg(all(
    target_os = "android",
@@ -38,20 +38,20 @@ pub enum Error {
    #[error("{backend} could not hook {target:#x}: {message}")]
    Attach {
       backend: &'static str,
-      target:  usize,
+      target: usize,
       message: String,
    },
    #[error("{backend} could not unhook {target:#x}: {message}")]
    Detach {
       backend: &'static str,
-      target:  usize,
+      target: usize,
       message: String,
    },
    #[error("{addr:#x} is not in any mapping")]
    Unmapped { addr: usize },
    #[error("mprotect {addr:#x}")]
    Protect {
-      addr:   usize,
+      addr: usize,
       #[source]
       source: std::io::Error,
    },
