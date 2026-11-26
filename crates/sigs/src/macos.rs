@@ -288,19 +288,13 @@ pub fn gpui(image: &Image<'_>) -> Found<Gpui> {
       })
       .ok_or("div_style_mut not found in ActionRow")?;
 
-   // `text_block` is the non-GPUI builder inside `ActionRow`'s first block
-   // (called right before the two style helpers preceding `div_child_div`).
-   let text_block = ar_calls[..first_child_idx]
-      .iter()
-      .rev()
-      .map(|&(_, c)| c)
-      .find(|&c| {
-         !near_div(c)
-            && image
-               .function_bounds(c)
-               .is_some_and(|(s, e)| e - s >= 0x80)
-      })
-      .ok_or("text_block not found in ActionRow")?;
+   // `text_block` is the builder in `ActionRow`'s first block that takes the
+   // row's two `SharedString`s as `x0`/`x1` (copied from `x19`/`x20` into
+   // stack slots) and returns the `Div` through `x8`. The old call-order
+   // heuristic picked a Div style helper here, which treats `x0` as a Div
+   // and crashes when we hand it a string.
+   let text_block =
+      find_text_block(image, action_row).ok_or("text_block not found in ActionRow")?;
 
    Ok(Gpui {
       caller_loc,
@@ -418,6 +412,46 @@ fn shared_string_tag_offset(image: &Image<'_>, func: usize) -> Option<usize> {
 
 fn has_shared_string_tag_check(image: &Image<'_>, func: usize) -> bool {
    shared_string_tag_offset(image, func).is_some()
+}
+
+/// Finds the text builder called with `ActionRow`'s two `SharedString`s.
+///
+/// Just before the call, `ldr q0, [x19]` / `ldr q0, [x20]` copy the row's two
+/// 24-byte strings into stack slots that become `x0` and `x1`; `x8` holds the
+/// sret `Div`. A size check keeps the tiny address-of thunks and style helpers
+/// out of the way.
+fn find_text_block(image: &Image<'_>, func: usize) -> Option<usize> {
+   let (start, end) = image.function_bounds(func)?;
+   let bytes = image.read(start, end - start)?;
+   for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+      let insn = u32::from_le_bytes(*chunk);
+      let Some((true, target)) = arm64::decode_branch26(insn, start + i * 4) else {
+         continue;
+      };
+      if image
+         .function_bounds(target)
+         .is_none_or(|(s, e)| e - s < 0x80)
+      {
+         continue;
+      }
+      let mut from_19 = false;
+      let mut from_20 = false;
+      for prev in &bytes.as_chunks::<4>().0[i.saturating_sub(12)..i] {
+         let prev = u32::from_le_bytes(*prev);
+         // `ldr q?, [x19]` / `ldr q?, [x20]`
+         if prev & 0xFFC0_0C1F == 0x3DC0_0000 {
+            match (prev >> 5) & 0x1F {
+               19 => from_19 = true,
+               20 => from_20 = true,
+               _ => {}
+            }
+         }
+      }
+      if from_19 && from_20 {
+         return Some(target);
+      }
+   }
+   None
 }
 
 /// Finds `alloc_or_oom` called via a `mov w0, #8; mov w1, #0x20; b alloc_or_oom`
