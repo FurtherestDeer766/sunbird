@@ -22,6 +22,8 @@ use std::{
       PoisonError,
    },
 };
+#[cfg(target_arch = "aarch64")]
+use std::rc::Rc;
 
 use phoenix_hook::image::Image;
 use phoenix_runtime::{
@@ -224,19 +226,10 @@ unsafe impl Sync for RcFnVtbl {}
 /// entry. A null `drop_in_place` makes that a null call; leak instead.
 const extern "C" fn no_drop(_: *mut c_void) {}
 
-/// `Rc::drop` frees `vtable.size + 16` bytes. Discord arm64's closure is 16
-/// bytes (its `RcBox` is 32); reporting 8 frees a 24-byte layout and corrupts
-/// the heap when Discord clones or drops our fake closure.
 static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: no_drop as *const c_void,
-   #[cfg(target_arch = "x86_64")]
    size:          size_of::<u64>(),
-   #[cfg(target_arch = "aarch64")]
-   size:          size_of::<[u64; 2]>(),
-   #[cfg(target_arch = "x86_64")]
    align:         align_of::<u64>(),
-   #[cfg(target_arch = "aarch64")]
-   align:         align_of::<[u64; 2]>(),
    call_once:     switch_callback as *const c_void,
    call_mut:      switch_callback as *const c_void,
    call:          switch_callback as *const c_void,
@@ -245,14 +238,8 @@ static SWITCH_FN_VTBL: RcFnVtbl = RcFnVtbl {
 
 static BUTTON_FN_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: no_drop as *const c_void,
-   #[cfg(target_arch = "x86_64")]
    size:          size_of::<u64>(),
-   #[cfg(target_arch = "aarch64")]
-   size:          size_of::<[u64; 2]>(),
-   #[cfg(target_arch = "x86_64")]
    align:         align_of::<u64>(),
-   #[cfg(target_arch = "aarch64")]
-   align:         align_of::<[u64; 2]>(),
    call_once:     button_callback as *const c_void,
    call_mut:      button_callback as *const c_void,
    call:          button_callback as *const c_void,
@@ -483,6 +470,42 @@ fn lookup_action(id: u64) -> Option<Action> {
    usize::try_from(id)
       .ok()
       .and_then(|idx| list.get(idx).cloned())
+}
+
+/// Real `Rc<dyn Fn>` fat pointer. Discord clones and drops these closures, so
+/// the vtable must be Rust's own: a hand-built one has no matching allocator
+/// layout and corrupts its heap on the next frame.
+#[cfg(target_arch = "aarch64")]
+fn real_rc<F>(closure: F) -> (usize, usize)
+where
+   F: Fn(*const c_void, *mut c_void, *mut c_void) + 'static,
+{
+   let rc: Rc<dyn Fn(*const c_void, *mut c_void, *mut c_void)> = Rc::new(closure);
+   // SAFETY: `Rc<dyn Fn>` is a `(data, vtable)` fat pointer; `forget` keeps the
+   // allocation alive for Discord, which drops it with that vtable.
+   let pair = unsafe { std::mem::transmute_copy::<_, (usize, usize)>(&rc) };
+   std::mem::forget(rc);
+   pair
+}
+
+#[cfg(target_arch = "aarch64")]
+fn button_rc(action: Action) -> (usize, usize) {
+   let id = register_action(action);
+   real_rc(move |_, _, _| unsafe {
+      button_callback(&raw const id, ptr::null(), ptr::null_mut(), ptr::null_mut());
+   })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn switch_rc(action: Action) -> (usize, usize) {
+   let id = register_action(action);
+   let rc: Rc<dyn Fn(u8, *mut c_void, *mut c_void)> = Rc::new(move |checked, window, app| unsafe {
+      switch_callback(&raw const id, checked, window, app);
+   });
+   // SAFETY: as in `real_rc`, with the Switch closure's signature.
+   let pair = unsafe { std::mem::transmute_copy::<_, (usize, usize)>(&rc) };
+   std::mem::forget(rc);
+   pair
 }
 
 /// Rust ABI like the `Fn::call` slot it fills: on Linux `extern "C"` would
@@ -954,16 +977,14 @@ impl Builder {
       size: BtnSize,
       action: Action,
    ) -> RawButton {
-      let rc_ptr = self.alloc_rc_action(action);
-      new_button(
-         self.sym,
-         id,
-         label,
-         variant,
-         size,
-         &raw const BUTTON_FN_VTBL,
-         rc_ptr,
-      )
+      #[cfg(target_arch = "x86_64")]
+      let (rc_ptr, vtbl): (usize, usize) = (
+         self.alloc_rc_action(action) as usize,
+         (&raw const BUTTON_FN_VTBL).cast::<c_void>() as usize,
+      );
+      #[cfg(target_arch = "aarch64")]
+      let (rc_ptr, vtbl) = button_rc(action);
+      new_button(self.sym, id, label, variant, size, rc_ptr, vtbl)
    }
 
    fn push_button(
@@ -1043,8 +1064,17 @@ impl Builder {
       {
          sw.put(at.description, SharedString::from_str(desc));
       }
-      sw.put(at.on_change, self.alloc_rc_action(action));
-      sw.put(at.on_change + 8, &raw const SWITCH_FN_VTBL);
+      #[cfg(target_arch = "x86_64")]
+      {
+         sw.put(at.on_change, self.alloc_rc_action(action) as usize);
+         sw.put(at.on_change + 8, (&raw const SWITCH_FN_VTBL).cast::<c_void>() as usize);
+      }
+      #[cfg(target_arch = "aarch64")]
+      {
+         let (rc_ptr, vtbl) = switch_rc(action);
+         sw.put(at.on_change, rc_ptr);
+         sw.put(at.on_change + 8, vtbl);
+      }
 
       #[cfg(target_arch = "x86_64")]
       {
@@ -1216,7 +1246,15 @@ pub fn build_raw_button(
 ) -> Option<RawButton> {
    let sym = SYMBOLS.get()?;
    let rc_ptr = alloc_rc_u64(action_id)?;
-   Some(new_button(sym, id, label, variant, size, vtbl, rc_ptr))
+   Some(new_button(
+      sym,
+      id,
+      label,
+      variant,
+      size,
+      vtbl as usize,
+      rc_ptr as usize,
+   ))
 }
 
 /// A native Mana `Button` with our `variant`, `size` and `Rc<dyn Fn>` click
@@ -1227,8 +1265,8 @@ fn new_button(
    label: &str,
    variant: BtnVariant,
    size: BtnSize,
-   vtbl: *const RcFnVtbl,
-   rc_ptr: *mut RcInner,
+   vtbl: usize,
+   rc_ptr: usize,
 ) -> RawButton {
    let at = &sym.layout.button;
    let id_static = intern(id);
