@@ -11,6 +11,8 @@
 mod accessories;
 #[cfg(target_arch = "x86_64")]
 mod badges;
+#[cfg(target_os = "macos")]
+mod captcha;
 #[cfg(target_arch = "x86_64")]
 mod context_menu;
 #[cfg(target_arch = "x86_64")]
@@ -99,7 +101,10 @@ pub fn prepare() -> Result<(), Error> {
    staff::prepare(&image);
    settings::install(&image);
    #[cfg(target_os = "macos")]
-   fetch::preload();
+   {
+      fetch::preload();
+      captcha::install();
+   }
    #[cfg(target_arch = "x86_64")]
    {
       modal::install(&image);
