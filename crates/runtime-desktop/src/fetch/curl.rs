@@ -62,6 +62,11 @@ unsafe fn sym<T>(lib: *mut c_void, name: &CStr) -> Option<T> {
    (!found.is_null()).then(|| unsafe { std::mem::transmute_copy::<*mut c_void, T>(&found) })
 }
 
+#[cfg(target_os = "macos")]
+pub fn preload() {
+   let _ = curl();
+}
+
 /// libcurl stays loaded for the life of the process, so the pointers never
 /// dangle.
 fn curl() -> Option<&'static Curl> {

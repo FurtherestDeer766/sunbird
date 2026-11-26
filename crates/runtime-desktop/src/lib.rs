@@ -98,6 +98,8 @@ pub fn prepare() -> Result<(), Error> {
    #[cfg(target_arch = "x86_64")]
    staff::prepare(&image);
    settings::install(&image);
+   #[cfg(target_os = "macos")]
+   fetch::preload();
    #[cfg(target_arch = "x86_64")]
    {
       modal::install(&image);

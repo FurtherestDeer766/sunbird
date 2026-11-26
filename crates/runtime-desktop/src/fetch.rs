@@ -9,6 +9,15 @@ mod winhttp;
 
 use phoenix_runtime::fetch::{FetchError, Request, Response};
 
+/// Loads libcurl from the constructor, on the main thread. macOS runs
+/// `AppKit`'s initializers after ours, holding the Objective-C runtime's lock
+/// while waiting on dyld's, so a first `dlopen` from another thread in that
+/// window deadlocks Discord at launch.
+#[cfg(target_os = "macos")]
+pub fn preload() {
+   curl::preload();
+}
+
 pub fn send(request: &Request) -> Result<Response, FetchError> {
    // A line break would smuggle extra headers in. The value is never echoed,
    // it may be a token.
